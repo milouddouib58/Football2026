@@ -9,7 +9,6 @@ from .config import config
 from .utils import log
 
 def _build_retry() -> Retry:
-    # Compatibility across urllib3 versions
     try:
         return Retry(
             total=config.MAX_RETRIES,
@@ -18,12 +17,12 @@ def _build_retry() -> Retry:
             allowed_methods=frozenset(["GET"])
         )
     except TypeError:
-        # urllib3<1.26
+        # ملاءمة لإصدارات أقدم
         return Retry(
             total=config.MAX_RETRIES,
             backoff_factor=1,
             status_forcelist=(429, 500, 502, 503, 504),
-            method_whitelist=frozenset(["GET"])  # deprecated name
+            method_whitelist=frozenset(["GET"])
         )
 
 class APIClient:
@@ -82,7 +81,7 @@ class APIClient:
 
     def get_teams_for_competitions(self, comp_ids: List[int]) -> Dict:
         log("Fetching teams for all target competitions...")
-        all_teams = {}
+        all_teams: Dict[int, Dict] = {}
         for comp_id in comp_ids:
             data = self._make_request(f"/competitions/{comp_id}/teams")
             if data and "teams" in data:
@@ -96,10 +95,8 @@ class APIClient:
                             "competitions": set()
                         }
                     all_teams[tid]["competitions"].add(comp_code)
-
-        # convert sets to lists for JSON
+        # تحويل المجموعات إلى قوائم لتخزين JSON
         for tid in list(all_teams.keys()):
             all_teams[tid]["competitions"] = list(all_teams[tid]["competitions"])
-
         log(f"Found {len(all_teams)} unique teams across competitions.")
         return all_teams
