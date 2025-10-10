@@ -23,7 +23,6 @@ def calculate_league_averages(matches: List[Dict]) -> Dict[str, float]:
         return {"avg_home_goals": 1.4, "avg_away_goals": 1.1, "home_adv": 0.3}
     avg_home = hg_sum / n
     avg_away = ag_sum / n
-    # تقدير ميزة الأرضية بشكل مبسط
     home_adv = max(0.0, min(0.8, avg_home - avg_away))
     return {"avg_home_goals": avg_home, "avg_away_goals": avg_away, "home_adv": home_adv}
 
@@ -33,10 +32,10 @@ def build_team_factors(matches: List[Dict], league_avgs: Dict, cutoff: datetime)
     hl = float(config.HALF_LIFE_DAYS)
     prior_games = float(config.PRIOR_GAMES)
 
-    scored_w = {}     # team -> weighted goals scored
-    expected_w = {}   # team -> weighted expected goals scored (league rate)
-    conceded_w = {}   # team -> weighted goals conceded
-    expectedc_w = {}  # team -> weighted expected conceded (league rate)
+    scored_w = {}
+    expected_w = {}
+    conceded_w = {}
+    expectedc_w = {}
 
     for m in matches:
         dt = parse_date_safe(m.get("utcDate"))
@@ -49,33 +48,33 @@ def build_team_factors(matches: List[Dict], league_avgs: Dict, cutoff: datetime)
         a = m.get("awayTeam", {}).get("id")
         if not h or not a:
             continue
+
         w = ewma_weight((cutoff - dt).days, hl)
 
-        # سجل الفريق المُضيف
+        # المضيف
         scored_w[h] = scored_w.get(h, 0.0) + w * hg
         expected_w[h] = expected_w.get(h, 0.0) + w * avg_home
         conceded_w[h] = conceded_w.get(h, 0.0) + w * ag
         expectedc_w[h] = expectedc_w.get(h, 0.0) + w * avg_away
 
-        # سجل الفريق الضيف
+        # الضيف
         scored_w[a] = scored_w.get(a, 0.0) + w * ag
         expected_w[a] = expected_w.get(a, 0.0) + w * avg_away
         conceded_w[a] = conceded_w.get(a, 0.0) + w * hg
         expectedc_w[a] = expectedc_w.get(a, 0.0) + w * avg_home
 
-    # حساب عوامل الهجوم/الدفاع مع تمهيد (shrinkage)
     A: Dict[str, float] = {}
     D: Dict[str, float] = {}
+    mean_rate = (avg_home + avg_away) / 2.0
+
     for tid in set(list(scored_w.keys()) + list(conceded_w.keys())):
-        # smoothing: أضف prior_games مباريات عند المتوسط
-        s = scored_w.get(tid, 0.0) + prior_games * (avg_home + avg_away) / 2.0
-        e = expected_w.get(tid, 0.0) + prior_games * (avg_home + avg_away) / 2.0
+        s = scored_w.get(tid, 0.0) + prior_games * mean_rate
+        e = expected_w.get(tid, 0.0) + prior_games * mean_rate
         a_factor = (s / e) if e > 0 else 1.0
 
-        sc = conceded_w.get(tid, 0.0) + prior_games * (avg_home + avg_away) / 2.0
-        ec = expectedc_w.get(tid, 0.0) + prior_games * (avg_home + avg_away) / 2.0
-        # ملاحظة: D>1 يعني دفاع أضعف (يتلقى أكثر من المتوقع)
-        d_factor = (sc / ec) if ec > 0 else 1.0
+        sc = conceded_w.get(tid, 0.0) + prior_games * mean_rate
+        ec = expectedc_w.get(tid, 0.0) + prior_games * mean_rate
+        d_factor = (sc / ec) if ec > 0 else 1.0  # >1 يعني دفاع أضعف
 
         A[str(tid)] = max(0.3, min(3.0, a_factor))
         D[str(tid)] = max(0.3, min(3.0, d_factor))
@@ -83,12 +82,10 @@ def build_team_factors(matches: List[Dict], league_avgs: Dict, cutoff: datetime)
     return A, D
 
 def build_elo_ratings(matches: List[Dict]) -> Dict[str, float]:
-    # إعداد بسيط لـELO بميزة أرضية ثابتة
-    K = 20.0
-    HFA = 60.0  # home field advantage pts
+    K = float(config.ELO_K)
+    HFA = float(config.ELO_HFA)
     elo: Dict[int, float] = {}
 
-    # فرز المباريات زمنيًا
     matches_sorted = sorted(
         [m for m in matches if parse_date_safe(m.get("utcDate"))],
         key=lambda m: parse_date_safe(m["utcDate"])
@@ -104,7 +101,6 @@ def build_elo_ratings(matches: List[Dict]) -> Dict[str, float]:
         eh = elo.get(h, 1500.0)
         ea = elo.get(a, 1500.0)
 
-        # توقع النتيجة للبيت مع HFA
         exp_home = 1.0 / (1.0 + 10 ** (-(eh + HFA - ea) / 400.0))
         res_home = 1.0 if hg > ag else 0.5 if hg == ag else 0.0
 
@@ -112,7 +108,6 @@ def build_elo_ratings(matches: List[Dict]) -> Dict[str, float]:
         elo[h] = eh + delta
         elo[a] = ea - delta
 
-    # تحويل المفاتيح إلى str للحفظ
     return {str(tid): rating for tid, rating in elo.items()}
 
 def fit_dc_rho_mle(matches: List[Dict], A: Dict, D: Dict, league_avgs: Dict) -> float:
@@ -136,7 +131,6 @@ def fit_dc_rho_mle(matches: List[Dict], A: Dict, D: Dict, league_avgs: Dict) -> 
         ll = 0.0
         for data in memo.values():
             lh, la, hg, ag = data['lh'], data['la'], data['hg'], data['ag']
-            # معاملات Dixon-Coles لتعديل احتمالات (0,0), (0,1), (1,0), (1,1)
             tau = 1.0
             if hg == 0 and ag == 0:
                 tau = 1.0 - rho * lh * la
@@ -152,13 +146,11 @@ def fit_dc_rho_mle(matches: List[Dict], A: Dict, D: Dict, league_avgs: Dict) -> 
         return ll
 
     best_rho, best_ll = 0.0, -float('inf')
-    # مسح شبكي بسيط 0.01 خطوة
     for r_int in range(int(-rho_max * 100), int(rho_max * 100) + 1):
         r = r_int / 100.0
         ll = loglik(r)
         if ll > best_ll:
             best_ll, best_rho = ll, r
-
     return best_rho
 
 def poisson_matrix_dc(lh: float, la: float, rho: float, max_goals: int = 8) -> List[List[float]]:
@@ -173,7 +165,6 @@ def poisson_matrix_dc(lh: float, la: float, rho: float, max_goals: int = 8) -> L
         M[1][0] *= max(1e-6, 1.0 + rho * la)
         M[1][1] *= max(1e-6, 1.0 - rho)
 
-    # إعادة التطبيع
     s = sum(sum(row) for row in M)
     if s > 0:
         for i in range(max_goals + 1):
@@ -182,8 +173,15 @@ def poisson_matrix_dc(lh: float, la: float, rho: float, max_goals: int = 8) -> L
     return M
 
 def matrix_to_outcomes(M: List[List[float]]) -> Tuple[float, float, float]:
-    # p_home, p_draw, p_away
     p_home = sum(M[i][j] for i in range(len(M)) for j in range(len(M[0])) if i > j)
     p_draw = sum(M[i][i] for i in range(min(len(M), len(M[0]))))
     p_away = 1.0 - p_home - p_draw
     return p_home, p_draw, p_away
+
+def top_scorelines(M: List[List[float]], top_k: int = 5) -> List[Tuple[int, int, float]]:
+    out: List[Tuple[int, int, float]] = []
+    for i in range(len(M)):
+        for j in range(len(M[0])):
+            out.append((i, j, M[i][j]))
+    out.sort(key=lambda x: x[2], reverse=True)
+    return out[:max(0, top_k)]
