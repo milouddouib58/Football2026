@@ -33,7 +33,7 @@ def run_trainer():
     }
 
     for season_key, matches in matches_by_season.items():
-        if len(matches) < 30:  # skip very small seasons
+        if len(matches) < 30:
             continue
         log(f"Training model for season: {season_key}")
 
