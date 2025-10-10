@@ -3,9 +3,9 @@ import re
 import math
 import difflib
 from datetime import datetime
-from typing import Optional, Tuple, Dict
+from typing import Optional, Tuple, Dict, List
 
-from .config import config  # FIX: import config
+from .config import config
 
 ARABIC_SYNONYMS = {
     "ريال مدريد": "Real Madrid", "برشلونة": "Barcelona", "برشلونه": "Barcelona",
@@ -46,6 +46,10 @@ def _norm_ascii(s: str) -> str:
     s = re.sub(r"[^a-z0-9\s]", " ", s)
     return re.sub(r"\s+", " ", s).strip()
 
+def _remove_ar_diacritics(s: str) -> str:
+    # إزالة التشكيل إن وجد
+    return re.sub(r'[\u064B-\u0652]', '', s)
+
 def transliterate_ar_to_en(s: str) -> str:
     ar_to_latin = {
         "ا":"a","أ":"a","إ":"i","آ":"a","ؤ":"u","ئ":"i","ب":"b","ت":"t","ث":"th",
@@ -53,6 +57,7 @@ def transliterate_ar_to_en(s: str) -> str:
         "ص":"s","ض":"d","ط":"t","ظ":"z","ع":"a","غ":"gh","ف":"f","ق":"q","ك":"k",
         "ل":"l","م":"m","ن":"n","ه":"h","و":"w","ي":"y","ى":"y","ة":"a",
     }
+    s = _remove_ar_diacritics(s or "")
     s_norm = re.sub(r'[^\u0600-\u06FF\s]', '', s)
     out = "".join([ar_to_latin.get(ch, ch) for ch in s_norm])
     return _norm_ascii(out)
@@ -62,6 +67,7 @@ def enhanced_team_search(team_name: str, teams_map: Dict, prefer_comp: Optional[
     if len(clean_name) < 2:
         return None
 
+    # مرادفات عربية مباشرة
     ar_key = clean_name.replace("ى", "ي").replace("ة", "ه")
     if ar_key in ARABIC_SYNONYMS:
         clean_name = ARABIC_SYNONYMS[ar_key]
@@ -70,26 +76,24 @@ def enhanced_team_search(team_name: str, teams_map: Dict, prefer_comp: Optional[
     tname_norm = clean_name.lower()
     tname_trans = transliterate_ar_to_en(clean_name)
 
-    teams_to_search = list(teams_map.values())
+    teams_to_search: List[Dict] = list(teams_map.values())
     if prefer_comp and prefer_comp in config.COMPETITION_PRIORITY:
-        preferred_teams = [t for t in teams_map.values() if prefer_comp in t.get('competitions', [])]
-        other_teams = [t for t in teams_map.values() if prefer_comp not in t.get('competitions', [])]
-        teams_to_search = preferred_teams + other_teams
+        preferred = [t for t in teams_to_search if prefer_comp in t.get('competitions', [])]
+        others = [t for t in teams_to_search if prefer_comp not in t.get('competitions', [])]
+        teams_to_search = preferred + others
 
     for team_data in teams_to_search:
-        tid = team_data['id']
+        tid = team_data.get('id')
         all_names = [n for n in team_data.get('names', []) if n]
 
-        # direct/normalized comparison
         for name in all_names:
-            score = difflib.SequenceMatcher(None, tname_norm, name.lower()).ratio()
+            score = difflib.SequenceMatcher(None, tname_norm, (name or "").lower()).ratio()
             if score > best_score:
                 best_score, best_id = score, tid
 
-        # transliteration comparison (FIX: compare tname_trans)
         if tname_trans:
             for name in all_names:
-                score = difflib.SequenceMatcher(None, tname_trans, _norm_ascii(name)).ratio()
+                score = difflib.SequenceMatcher(None, tname_trans, _norm_ascii(name or "")).ratio()
                 if score > best_score:
                     best_score, best_id = score, tid
 
