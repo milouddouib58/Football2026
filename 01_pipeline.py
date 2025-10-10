@@ -1,5 +1,6 @@
 # 01_pipeline.py
 import json
+import argparse
 from datetime import datetime
 from common.config import config
 from common.api_client import APIClient
@@ -33,7 +34,6 @@ def run_pipeline(years_to_fetch: int = 15):
         json.dump(list(all_matches.values()), f, ensure_ascii=False, indent=2)
     log(f"Match data saved to {output_path}")
 
-    # teams
     teams_data = client.get_teams_for_competitions(list(target_comps.values()))
     teams_path = config.DATA_DIR / "teams.json"
     with open(teams_path, 'w', encoding='utf-8') as f:
@@ -43,4 +43,7 @@ def run_pipeline(years_to_fetch: int = 15):
     log("--- Data Pipeline Finished ---", "INFO")
 
 if __name__ == "__main__":
-    run_pipeline()
+    parser = argparse.ArgumentParser(description="Build local dataset from football-data.org")
+    parser.add_argument("--years", type=int, default=15, help="How many past years to fetch per competition.")
+    args = parser.parse_args()
+    run_pipeline(years_to_fetch=args.years)
