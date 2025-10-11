@@ -1,170 +1,196 @@
-# common/modeling.py (النسخة الكاملة والمصححة)
+# -*- coding: utf-8 -*-
+# -----------------------------------------------------------------------------
+# app.py (النسخة النهائية المنظمة والمصححة)
+# -----------------------------------------------------------------------------
+# الوصف:
+#   واجهة مستخدم رسومية باستخدام Streamlit لمشروع التنبؤ بنتائج مباريات كرة القدم.
+# -----------------------------------------------------------------------------
 
-import math
+# --- 1. الإعداد الأولي والاستيراد ---
+import sys
+import os
+import json
+import subprocess
+from pathlib import Path
 from datetime import datetime
-from typing import Dict, List, Tuple, Any
+from typing import Dict, List, Tuple, Optional
 
-# يتطلب تثبيت: pip install scipy
-from scipy.optimize import minimize
+import streamlit as st
 
-# استيراد الوحدات المشتركة بالطريقة الصحيحة
-from common import config
-from common.utils import parse_date_safe, parse_score, poisson_pmf
+# الحل النهائي لمشكلة المسار (Path) لضمان العثور على مجلد 'common'
+APP_ROOT = Path(__file__).resolve().parent
+if str(APP_ROOT) not in sys.path:
+    sys.path.insert(0, str(APP_ROOT))
 
-
-def ewma_weight(delta_days: float, half_life_days: float) -> float:
-    """
-    يحسب الوزن باستخدام المتوسط المتحرك الأسي الموزون (EWMA).
-    """
-    if delta_days <= 0:
-        return 1.0
-    return 0.5 ** (delta_days / max(half_life_days, 1.0))
-
-def calculate_league_averages(matches: List[Dict]) -> Dict[str, float]:
-    """
-    يحسب متوسط الأهداف المسجلة للفريق المضيف والضيف في الدوري.
-    """
-    hg_sum = ag_sum = n = 0
-    for m in matches:
-        hg, ag = parse_score(m)
-        if hg is None: continue
-        hg_sum += hg
-        ag_sum += ag
-        n += 1
-    if n == 0:
-        return {"avg_home_goals": 1.4, "avg_away_goals": 1.1, "home_adv": 0.3}
-    avg_home = hg_sum / n
-    avg_away = ag_sum / n
-    home_adv = max(0.0, min(0.8, avg_home - avg_away))
-    return {"avg_home_goals": avg_home, "avg_away_goals": avg_away, "home_adv": home_adv}
-
-def build_team_factors(
-    matches: List[Dict], league_avgs: Dict, cutoff: datetime
-) -> Tuple[Dict[str, float], Dict[str, float]]:
-    """
-    يبني عوامل قوة الهجوم والدفاع لكل فريق.
-    """
-    avg_home = league_avgs["avg_home_goals"]
-    avg_away = league_avgs["avg_away_goals"]
-    hl = float(config.HALF_LIFE_DAYS)
-    prior_games = float(config.PRIOR_GAMES)
-    scored_w, expected_w, conceded_w, expectedc_w = {}, {}, {}, {}
-
-    for m in matches:
-        dt = parse_date_safe(m.get("utcDate"))
-        if not dt or dt > cutoff: continue
-        hg, ag = parse_score(m)
-        h_id, a_id = m.get("homeTeam", {}).get("id"), m.get("awayTeam", {}).get("id")
-        if hg is None or not h_id or not a_id: continue
-
-        w = ewma_weight((cutoff - dt).days, hl)
-        scored_w[h_id] = scored_w.get(h_id, 0.0) + w * hg
-        expected_w[h_id] = expected_w.get(h_id, 0.0) + w * avg_home
-        conceded_w[h_id] = conceded_w.get(h_id, 0.0) + w * ag
-        expectedc_w[h_id] = expectedc_w.get(h_id, 0.0) + w * avg_away
-        scored_w[a_id] = scored_w.get(a_id, 0.0) + w * ag
-        expected_w[a_id] = expected_w.get(a_id, 0.0) + w * avg_away
-        conceded_w[a_id] = conceded_w.get(a_id, 0.0) + w * hg
-        expectedc_w[a_id] = expectedc_w.get(a_id, 0.0) + w * avg_home
-
-    A: Dict[str, float] = {}
-    D: Dict[str, float] = {}
-    mean_rate = (avg_home + avg_away) / 2.0
-    all_team_ids = set(list(scored_w.keys()) + list(conceded_w.keys()))
-
-    for tid in all_team_ids:
-        s = scored_w.get(tid, 0.0) + prior_games * mean_rate
-        e = expected_w.get(tid, 0.0) + prior_games * mean_rate
-        a_factor = (s / e) if e > 0 else 1.0
-        sc = conceded_w.get(tid, 0.0) + prior_games * mean_rate
-        ec = expectedc_w.get(tid, 0.0) + prior_games * mean_rate
-        d_factor = (sc / ec) if ec > 0 else 1.0
-        A[str(tid)] = max(0.3, min(3.0, a_factor))
-        D[str(tid)] = max(0.3, min(3.0, d_factor))
-    return A, D
-
-def build_elo_ratings(matches: List[Dict]) -> Dict[str, float]:
-    """
-    يحسب تصنيف Elo الديناميكي للفرق.
-    """
-    elo: Dict[int, float] = {}
-    matches_sorted = sorted(
-        [m for m in matches if parse_date_safe(m.get("utcDate"))],
-        key=lambda m: parse_date_safe(m["utcDate"])
+# استيراد الوحدات من مجلد 'common' بأمان
+try:
+    from common import config
+    from common.utils import enhanced_team_search
+    from common.modeling import poisson_matrix_dc, matrix_to_outcomes, top_scorelines
+except ImportError as e:
+    st.error(
+        f"**خطأ فادح في الاستيراد:** لم يتم العثور على مجلد `common` أو ملفاته.\n"
+        f"تأكد من أن بنية المشروع صحيحة (وجود `common/__init__.py`).\n"
+        f"التفاصيل: {e}"
     )
-    for m in matches_sorted:
-        h, a = m.get("homeTeam", {}).get("id"), m.get("awayTeam", {}).get("id")
-        hg, ag = parse_score(m)
-        if not h or not a or hg is None: continue
-        eh, ea = elo.get(h, 1500.0), elo.get(a, 1500.0)
-        exp_home = 1.0 / (1.0 + 10 ** (-(eh + float(config.ELO_HFA) - ea) / 400.0))
-        res_home = 1.0 if hg > ag else 0.5 if hg == ag else 0.0
-        delta = float(config.ELO_K) * (res_home - exp_home)
-        elo[h], elo[a] = eh + delta, ea - delta
-    return {str(tid): rating for tid, rating in elo.items()}
+    st.stop()
 
-def fit_dc_rho_mle(matches: List[Dict], A: Dict, D: Dict, league_avgs: Dict) -> float:
-    """
-    يجد معامل الارتباط (rho) باستخدام خوارزمية تحسين من SciPy.
-    """
-    if len(matches) < 20 or not A or not D: return 0.0
-    rho_max = float(config.DC_RHO_MAX)
-    avg_home, avg_away = league_avgs["avg_home_goals"], league_avgs["avg_away_goals"]
-    memo = {}
-    for m in matches:
-        h, a = m.get("homeTeam", {}).get("id"), m.get("awayTeam", {}).get("id")
-        hg, ag = parse_score(m)
-        if not (h and a and hg is not None): continue
-        lh = max(0.1, avg_home * A.get(str(h), 1.0) * D.get(str(a), 1.0))
-        la = max(0.1, avg_away * A.get(str(a), 1.0) * D.get(str(h), 1.0))
-        memo[m['id']] = {'lh': lh, 'la': la, 'hg': hg, 'ag': ag}
+# --- 2. إعداد الصفحة ---
+st.set_page_config(page_title="⚽ Football Predictor", page_icon="⚽", layout="wide")
 
-    def log_likelihood(rho: float) -> float:
-        ll = 0.0
-        for data in memo.values():
-            lh, la, hg, ag = data['lh'], data['la'], data['hg'], data['ag']
-            tau = 1.0
-            if hg == 0 and ag == 0:   tau = 1.0 - rho * lh * la
-            elif hg == 0 and ag == 1: tau = 1.0 + rho * lh
-            elif hg == 1 and ag == 0: tau = 1.0 + rho * la
-            elif hg == 1 and ag == 1: tau = 1.0 - rho
-            if tau <= 1e-6: return -1e9
-            ll += (hg * math.log(lh) - lh) + (ag * math.log(la) - la) + math.log(tau)
-        return ll
+# --- 3. دوال تحميل البيانات والنماذج ---
+@st.cache_data
+def load_data_file(filename: str) -> Optional[dict]:
+    """تحميل ملف بيانات (مثل teams.json) مع معالجة الأخطاء."""
+    path = config.DATA_DIR / filename
+    if path.exists():
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except json.JSONDecodeError:
+            st.error(f"خطأ في قراءة ملف JSON: {filename}. قد يكون الملف تالفًا.")
+            return None
+    return None
 
-    result = minimize(lambda r: -log_likelihood(r[0]), x0=[0.0], bounds=[(-rho_max, rho_max)])
-    return float(result.x[0]) if result.success else 0.0
+@st.cache_data
+def load_all_models() -> Dict[str, dict]:
+    """تحميل جميع ملفات النماذج المدربة."""
+    models = {}
+    model_dir = config.MODELS_DIR
+    for name in ["league_averages", "team_factors", "elo_ratings", "rho_values"]:
+        models[name] = load_data_file(f"../models/{name}.json") or {} # المسار النسبي الصحيح
+    return models
 
-def poisson_matrix_dc(lh: float, la: float, rho: float, max_goals: int = 8) -> List[List[float]]:
-    pX = [poisson_pmf(i, lh) for i in range(max_goals + 1)]
-    pY = [poisson_pmf(j, la) for j in range(max_goals + 1)]
-    M = [[pX[i] * pY[j] for j in range(max_goals + 1)] for i in range(max_goals + 1)]
-    if max_goals >= 1:
-        M[0][0] *= max(1e-6, 1.0 - rho * lh * la)
-        M[0][1] *= max(1e-6, 1.0 + rho * lh)
-        M[1][0] *= max(1e-6, 1.0 + rho * la)
-        M[1][1] *= max(1e-6, 1.0 - rho)
-    s = sum(sum(row) for row in M)
-    if s > 0:
-        for i in range(max_goals + 1):
-            for j in range(max_goals + 1): M[i][j] /= s
-    return M
+# --- 4. المنطق الحسابي للتنبؤ ---
+def compute_prediction(home_name: str, away_name: str, comp_code: str, use_elo: bool, topk: int) -> dict:
+    teams_map = load_data_file("teams.json")
+    if not teams_map:
+        raise FileNotFoundError("ملف `teams.json` غير موجود. يرجى تشغيل 'بناء البيانات' أولاً.")
 
-def matrix_to_outcomes(M: List[List[float]]) -> Tuple[float, float, float]:
-    p_home = sum(M[i][j] for i in range(len(M)) for j in range(len(M[0])) if i > j)
-    p_draw = sum(M[i][i] for i in range(min(len(M), len(M[0]))))
-    p_away = 1.0 - p_home - p_draw
-    return p_home, p_draw, p_away
+    home_id = enhanced_team_search(home_name, teams_map, comp_code)
+    away_id = enhanced_team_search(away_name, teams_map, comp_code)
+    if not home_id or not away_id:
+        raise ValueError(f"لم يتم العثور على: '{home_name}' أو '{away_name}' في المسابقة المحددة.")
 
-# --- ✅ تم إضافة الدالة المفقودة هنا ---
-def top_scorelines(matrix: List[List[float]], top_k: int = 5) -> List[Tuple[int, int, float]]:
-    """
-    يستخرج أعلى K نتائج متوقعة من مصفوفة الاحتمالات.
-    """
-    flat_list = []
-    for i in range(len(matrix)):
-        for j in range(len(matrix[0])):
-            flat_list.append((i, j, matrix[i][j]))
-    flat_list.sort(key=lambda x: x[2], reverse=True)
-    return flat_list[:top_k]
-# ------------------------------------
+    now = datetime.now()
+    season_year = now.year if now.month >= config.CURRENT_SEASON_START_MONTH else now.year - 1
+    season_key = f"{comp_code}_{season_year}"
+    
+    models = load_all_models()
+    if not models["elo_ratings"].get(season_key):
+        season_key = f"{comp_code}_{season_year - 1}"
+        if not models["elo_ratings"].get(season_key):
+            raise FileNotFoundError(f"لا توجد نماذج للمسابقة {comp_code}. يرجى 'تدريب النماذج' أولاً.")
+
+    elo, factors, avgs, rho_data = models["elo_ratings"].get(season_key, {}), models["team_factors"].get(season_key, {}), models["league_averages"].get(season_key, {}), models["rho_values"]
+    rho = rho_data.get(season_key, 0.0)
+
+    elo_home, elo_away = float(elo.get(str(home_id), 1500)), float(elo.get(str(away_id), 1500))
+    home_attack, home_defense = float(factors.get("attack", {}).get(str(home_id), 1)), float(factors.get("defense", {}).get(str(home_id), 1))
+    away_attack, away_defense = float(factors.get("attack", {}).get(str(away_id), 1)), float(factors.get("defense", {}).get(str(away_id), 1))
+    avg_home, avg_away = float(avgs.get("avg_home_goals", 1.4)), float(avgs.get("avg_away_goals", 1.1))
+
+    lam_home, lam_away = home_attack * away_defense * avg_home, away_attack * home_defense * avg_away
+
+    if use_elo:
+        edge = (elo_home - elo_away) + config.ELO_HFA
+        factor = 10 ** (edge / config.ELO_LAMBDA_SCALE)
+        lam_home *= factor
+        lam_away = max(1e-9, lam_away / factor)
+
+    matrix = poisson_matrix_dc(lam_home, lam_away, rho)
+    p_home, p_draw, p_away = matrix_to_outcomes(matrix)
+    
+    return {
+        "match_info": f"{home_name} (المضيف) vs {away_name} (الضيف) - {comp_code}",
+        "model_season": season_key,
+        "probabilities": {"home": p_home, "draw": p_draw, "away": p_away},
+        "top_scores": [{"score": f"{s[0]}-{s[1]}", "prob": s[2]} for s in top_scorelines(matrix, topk)],
+    }
+
+# --- 5. أدوات الواجهة وتشغيل السكريبتات ---
+def run_cli_command(script_name: str, args: List[str] = []) -> Tuple[bool, str]:
+    cmd = [sys.executable, str(APP_ROOT / script_name)] + args
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, check=False)
+        return result.returncode == 0, f"STDOUT:\n{result.stdout}\n\nSTDERR:\n{result.stderr}"
+    except Exception as e:
+        return False, f"فشل في تشغيل العملية: {e}"
+
+def get_teams_for_competition(teams_map: Dict, comp_code: str) -> List[str]:
+    team_names = []
+    for team_data in teams_map.values():
+        if comp_code in team_data.get("competitions", []):
+            names = team_data.get("names", [])
+            if names:
+                primary_name = sorted(names, key=lambda n: (int(" " in n), len(n)), reverse=True)[0]
+                team_names.append(primary_name)
+    return sorted(team_names)
+
+# --- 6. بناء الواجهة الرسومية ---
+st.title("⚽ متنبئ نتائج مباريات كرة القدم")
+st.caption(f"الإصدار: {config.VERSION}")
+
+with st.sidebar:
+    st.header("⚙️ الإعداد والتحكم")
+    years = st.number_input("عدد المواسم لجلبها", 1, 10, 3)
+    if st.button("🏗️ بناء البيانات (Pipeline)"):
+        with st.spinner("جارٍ بناء قاعدة البيانات..."):
+            ok, logs = run_cli_command("01_pipeline.py", ["--years", str(years)])
+            st.cache_data.clear() # مسح الكاش بعد تحديث البيانات
+            st.toast("اكتمل بناء البيانات!", icon="✅" if ok else "❌")
+            if not ok:
+                with st.expander("عرض سجل الأخطاء"): st.code(logs)
+
+    if st.button("🧠 تدريب النماذج (Trainer)"):
+        with st.spinner("جارٍ تدريب النماذج..."):
+            ok, logs = run_cli_command("02_trainer.py")
+            st.cache_data.clear() # مسح الكاش بعد تحديث النماذج
+            st.toast("اكتمل تدريب النماذج!", icon="✅" if ok else "❌")
+            if not ok:
+                with st.expander("عرض سجل الأخطاء"): st.code(logs)
+    
+    st.divider()
+    st.header("🔧 خيارات التنبؤ")
+    use_elo = st.checkbox("تفعيل تعديل ELO", value=True)
+    topk = st.slider("عدد أعلى النتائج", 0, 10, 5)
+
+st.header("🔮 التنبؤ بمباراة")
+teams_map = load_data_file("teams.json")
+if not teams_map:
+    st.warning("لم يتم العثور على بيانات الفرق. يرجى تشغيل 'بناء البيانات' أولاً.")
+else:
+    all_comps = sorted(config.TARGET_COMPETITIONS)
+    comp_code = st.selectbox("اختر المسابقة", options=all_comps)
+    
+    comp_teams = get_teams_for_competition(teams_map, comp_code)
+    
+    if not comp_teams:
+        st.warning(f"لا توجد فرق للمسابقة '{comp_code}'. تأكد من إضافتها لـ TARGET_COMPETITIONS وتشغيل بناء البيانات.")
+    else:
+        col1, col2 = st.columns(2)
+        home_name = col1.selectbox("الفريق المضيف", options=comp_teams)
+        away_name = col2.selectbox("الفريق الضيف", options=comp_teams, index=min(1, len(comp_teams)-1))
+
+        if st.button("احسب التنبؤ", type="primary", use_container_width=True):
+            if home_name == away_name:
+                st.error("يرجى اختيار فريقين مختلفين.")
+            else:
+                try:
+                    with st.spinner("جاري حساب الاحتمالات..."):
+                        result = compute_prediction(home_name, away_name, comp_code, use_elo, topk)
+
+                    st.subheader(result["match_info"])
+                    st.caption(f"تم استخدام نماذج موسم: {result['model_season']}")
+                    
+                    probs = result["probabilities"]
+                    c1, c2, c3 = st.columns(3)
+                    c1.metric("فوز المضيف", f"{probs['home']:.1%}")
+                    c2.metric("تعادل", f"{probs['draw']:.1%}")
+                    c3.metric("فوز الضيف", f"{probs['away']:.1%}")
+
+                    if topk > 0 and result["top_scores"]:
+                        st.write("**أعلى النتائج المحتملة:**")
+                        df_scores = st.dataframe([{"النتيجة": s["score"], "الاحتمال": f"{s['prob']:.2%}"} for s in result["top_scores"]], use_container_width=True)
+                except Exception as e:
+                    st.error(f"حدث خطأ أثناء التنبؤ: {e}")
