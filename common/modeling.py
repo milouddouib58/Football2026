@@ -1,16 +1,33 @@
-# common/modeling.py
+# common/modeling.py (النسخة المحسنة)
+
 import math
 from datetime import datetime
-from typing import Dict, List, Tuple
-from .config import config
+from typing import Dict, List, Tuple, Any
+
+# يتطلب تثبيت: pip install scipy
+from scipy.optimize import minimize
+
+
+from common import config
+
 from .utils import parse_date_safe, parse_score, poisson_pmf
 
+
+# --- 1. التحسينات الأساسية المدمجة ---
+
 def ewma_weight(delta_days: float, half_life_days: float) -> float:
+    """
+    يحسب الوزن باستخدام المتوسط المتحرك الأسي الموزون (EWMA).
+    يعطي المباريات الأحدث وزناً أكبر.
+    """
     if delta_days <= 0:
         return 1.0
     return 0.5 ** (delta_days / max(half_life_days, 1.0))
 
 def calculate_league_averages(matches: List[Dict]) -> Dict[str, float]:
+    """
+    يحسب متوسط الأهداف المسجلة للفريق المضيف والضيف في الدوري.
+    """
     hg_sum = ag_sum = n = 0
     for m in matches:
         hg, ag = parse_score(m)
@@ -26,94 +43,87 @@ def calculate_league_averages(matches: List[Dict]) -> Dict[str, float]:
     home_adv = max(0.0, min(0.8, avg_home - avg_away))
     return {"avg_home_goals": avg_home, "avg_away_goals": avg_away, "home_adv": home_adv}
 
-def build_team_factors(matches: List[Dict], league_avgs: Dict, cutoff: datetime) -> Tuple[Dict[str, float], Dict[str, float]]:
+def build_team_factors(
+    matches: List[Dict], league_avgs: Dict, cutoff: datetime
+) -> Tuple[Dict[str, float], Dict[str, float]]:
+    """
+    يبني عوامل قوة الهجوم والدفاع لكل فريق بناءً على أدائه الموزون زمنياً.
+    """
     avg_home = league_avgs["avg_home_goals"]
     avg_away = league_avgs["avg_away_goals"]
     hl = float(config.HALF_LIFE_DAYS)
     prior_games = float(config.PRIOR_GAMES)
 
-    scored_w = {}
-    expected_w = {}
-    conceded_w = {}
-    expectedc_w = {}
+    scored_w, expected_w = {}, {}
+    conceded_w, expectedc_w = {}, {}
 
     for m in matches:
         dt = parse_date_safe(m.get("utcDate"))
         if not dt or dt > cutoff:
             continue
         hg, ag = parse_score(m)
-        if hg is None or ag is None:
-            continue
-        h = m.get("homeTeam", {}).get("id")
-        a = m.get("awayTeam", {}).get("id")
-        if not h or not a:
+        h_id, a_id = m.get("homeTeam", {}).get("id"), m.get("awayTeam", {}).get("id")
+        if hg is None or not h_id or not a_id:
             continue
 
         w = ewma_weight((cutoff - dt).days, hl)
 
-        # المضيف
-        scored_w[h] = scored_w.get(h, 0.0) + w * hg
-        expected_w[h] = expected_w.get(h, 0.0) + w * avg_home
-        conceded_w[h] = conceded_w.get(h, 0.0) + w * ag
-        expectedc_w[h] = expectedc_w.get(h, 0.0) + w * avg_away
+        scored_w[h_id] = scored_w.get(h_id, 0.0) + w * hg
+        expected_w[h_id] = expected_w.get(h_id, 0.0) + w * avg_home
+        conceded_w[h_id] = conceded_w.get(h_id, 0.0) + w * ag
+        expectedc_w[h_id] = expectedc_w.get(h_id, 0.0) + w * avg_away
 
-        # الضيف
-        scored_w[a] = scored_w.get(a, 0.0) + w * ag
-        expected_w[a] = expected_w.get(a, 0.0) + w * avg_away
-        conceded_w[a] = conceded_w.get(a, 0.0) + w * hg
-        expectedc_w[a] = expectedc_w.get(a, 0.0) + w * avg_home
+        scored_w[a_id] = scored_w.get(a_id, 0.0) + w * ag
+        expected_w[a_id] = expected_w.get(a_id, 0.0) + w * avg_away
+        conceded_w[a_id] = conceded_w.get(a_id, 0.0) + w * hg
+        expectedc_w[a_id] = expectedc_w.get(a_id, 0.0) + w * avg_home
 
     A: Dict[str, float] = {}
     D: Dict[str, float] = {}
     mean_rate = (avg_home + avg_away) / 2.0
+    all_team_ids = set(list(scored_w.keys()) + list(conceded_w.keys()))
 
-    for tid in set(list(scored_w.keys()) + list(conceded_w.keys())):
+    for tid in all_team_ids:
         s = scored_w.get(tid, 0.0) + prior_games * mean_rate
         e = expected_w.get(tid, 0.0) + prior_games * mean_rate
         a_factor = (s / e) if e > 0 else 1.0
 
         sc = conceded_w.get(tid, 0.0) + prior_games * mean_rate
         ec = expectedc_w.get(tid, 0.0) + prior_games * mean_rate
-        d_factor = (sc / ec) if ec > 0 else 1.0  # >1 يعني دفاع أضعف
+        d_factor = (sc / ec) if ec > 0 else 1.0
 
         A[str(tid)] = max(0.3, min(3.0, a_factor))
         D[str(tid)] = max(0.3, min(3.0, d_factor))
-
     return A, D
 
 def build_elo_ratings(matches: List[Dict]) -> Dict[str, float]:
-    K = float(config.ELO_K)
-    HFA = float(config.ELO_HFA)
+    """
+    يحسب تصنيف Elo الديناميكي للفرق بترتيب المباريات زمنياً.
+    """
     elo: Dict[int, float] = {}
-
     matches_sorted = sorted(
         [m for m in matches if parse_date_safe(m.get("utcDate"))],
         key=lambda m: parse_date_safe(m["utcDate"])
     )
-
     for m in matches_sorted:
-        h = m.get("homeTeam", {}).get("id")
-        a = m.get("awayTeam", {}).get("id")
+        h, a = m.get("homeTeam", {}).get("id"), m.get("awayTeam", {}).get("id")
         hg, ag = parse_score(m)
-        if not h or not a or hg is None or ag is None:
+        if not h or not a or hg is None:
             continue
 
-        eh = elo.get(h, 1500.0)
-        ea = elo.get(a, 1500.0)
-
-        exp_home = 1.0 / (1.0 + 10 ** (-(eh + HFA - ea) / 400.0))
+        eh, ea = elo.get(h, 1500.0), elo.get(a, 1500.0)
+        exp_home = 1.0 / (1.0 + 10 ** (-(eh + float(config.ELO_HFA) - ea) / 400.0))
         res_home = 1.0 if hg > ag else 0.5 if hg == ag else 0.0
-
-        delta = K * (res_home - exp_home)
-        elo[h] = eh + delta
-        elo[a] = ea - delta
-
+        delta = float(config.ELO_K) * (res_home - exp_home)
+        elo[h], elo[a] = eh + delta, ea - delta
     return {str(tid): rating for tid, rating in elo.items()}
 
 def fit_dc_rho_mle(matches: List[Dict], A: Dict, D: Dict, league_avgs: Dict) -> float:
+    """
+    [محسّن بالأداء] يجد معامل الارتباط (rho) باستخدام خوارزمية تحسين من SciPy.
+    """
     if len(matches) < 20 or not A or not D:
         return 0.0
-
     rho_max = float(config.DC_RHO_MAX)
     avg_home, avg_away = league_avgs["avg_home_goals"], league_avgs["avg_away_goals"]
 
@@ -121,50 +131,42 @@ def fit_dc_rho_mle(matches: List[Dict], A: Dict, D: Dict, league_avgs: Dict) -> 
     for m in matches:
         h, a = m.get("homeTeam", {}).get("id"), m.get("awayTeam", {}).get("id")
         hg, ag = parse_score(m)
-        if not (h and a and hg is not None and ag is not None):
+        if not (h and a and hg is not None):
             continue
         lh = max(0.1, avg_home * A.get(str(h), 1.0) * D.get(str(a), 1.0))
         la = max(0.1, avg_away * A.get(str(a), 1.0) * D.get(str(h), 1.0))
         memo[m['id']] = {'lh': lh, 'la': la, 'hg': hg, 'ag': ag}
 
-    def loglik(rho: float) -> float:
+    def log_likelihood(rho: float) -> float:
         ll = 0.0
         for data in memo.values():
             lh, la, hg, ag = data['lh'], data['la'], data['hg'], data['ag']
             tau = 1.0
-            if hg == 0 and ag == 0:
-                tau = 1.0 - rho * lh * la
-            elif hg == 0 and ag == 1:
-                tau = 1.0 + rho * lh
-            elif hg == 1 and ag == 0:
-                tau = 1.0 + rho * la
-            elif hg == 1 and ag == 1:
-                tau = 1.0 - rho
-            if tau <= 1e-6:
-                return -float('inf')
+            if hg == 0 and ag == 0:   tau = 1.0 - rho * lh * la
+            elif hg == 0 and ag == 1: tau = 1.0 + rho * lh
+            elif hg == 1 and ag == 0: tau = 1.0 + rho * la
+            elif hg == 1 and ag == 1: tau = 1.0 - rho
+            if tau <= 1e-6: return -1e9
             ll += (hg * math.log(lh) - lh) + (ag * math.log(la) - la) + math.log(tau)
         return ll
 
-    best_rho, best_ll = 0.0, -float('inf')
-    for r_int in range(int(-rho_max * 100), int(rho_max * 100) + 1):
-        r = r_int / 100.0
-        ll = loglik(r)
-        if ll > best_ll:
-            best_ll, best_rho = ll, r
-    return best_rho
+    objective_func = lambda rho: -log_likelihood(rho[0])
+    result = minimize(
+        objective_func, x0=[0.0], bounds=[(-rho_max, rho_max)], method='L-BFGS-B'
+    )
+    return float(result.x[0]) if result.success else 0.0
 
+
+# --- 2. دوال مساعدة للتنبؤ (موجودة سابقًا) ---
 def poisson_matrix_dc(lh: float, la: float, rho: float, max_goals: int = 8) -> List[List[float]]:
     pX = [poisson_pmf(i, lh) for i in range(max_goals + 1)]
     pY = [poisson_pmf(j, la) for j in range(max_goals + 1)]
-
     M = [[pX[i] * pY[j] for j in range(max_goals + 1)] for i in range(max_goals + 1)]
-
     if max_goals >= 1:
         M[0][0] *= max(1e-6, 1.0 - rho * lh * la)
         M[0][1] *= max(1e-6, 1.0 + rho * lh)
         M[1][0] *= max(1e-6, 1.0 + rho * la)
         M[1][1] *= max(1e-6, 1.0 - rho)
-
     s = sum(sum(row) for row in M)
     if s > 0:
         for i in range(max_goals + 1):
@@ -178,10 +180,42 @@ def matrix_to_outcomes(M: List[List[float]]) -> Tuple[float, float, float]:
     p_away = 1.0 - p_home - p_draw
     return p_home, p_draw, p_away
 
-def top_scorelines(M: List[List[float]], top_k: int = 5) -> List[Tuple[int, int, float]]:
-    out: List[Tuple[int, int, float]] = []
-    for i in range(len(M)):
-        for j in range(len(M[0])):
-            out.append((i, j, M[i][j]))
-    out.sort(key=lambda x: x[2], reverse=True)
-    return out[:max(0, top_k)]
+
+# --- 3. [إضافة جديدة] هندسة ميزات "الفورمة" ---
+def calculate_team_form(
+    all_matches: List[Dict], team_id: int, on_date: datetime, num_matches: int = 5
+) -> Dict[str, Any]:
+    """
+    يحسب "فورمة" فريق معين بناءً على آخر N مباريات لعبها قبل تاريخ محدد.
+    """
+    team_matches = []
+    for m in all_matches:
+        dt = parse_date_safe(m.get("utcDate"))
+        if not dt or dt >= on_date: # تجاهل المباريات المستقبلية
+            continue
+        h_id, a_id = m.get("homeTeam", {}).get("id"), m.get("awayTeam", {}).get("id")
+        if team_id in (h_id, a_id):
+            team_matches.append(m)
+
+    team_matches_sorted = sorted(
+        team_matches, key=lambda m: parse_date_safe(m["utcDate"]), reverse=True
+    )
+    last_n_matches = team_matches_sorted[:num_matches]
+
+    if not last_n_matches:
+        return {"matches_analyzed": 0, "avg_points": 1.0} # قيمة افتراضية
+
+    points = 0
+    for m in last_n_matches:
+        hg, ag = parse_score(m)
+        if hg is None: continue
+        is_home = (m["homeTeam"]["id"] == team_id)
+        if (is_home and hg > ag) or (not is_home and ag > hg):
+            points += 3
+        elif hg == ag:
+            points += 1
+
+    return {
+        "matches_analyzed": len(last_n_matches),
+        "avg_points": round(points / len(last_n_matches), 2)
+    }

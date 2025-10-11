@@ -1,47 +1,72 @@
-# common/config.py
-from pathlib import Path
+# common/config.py (النسخة الكاملة والمحدثة)
+
 import os
+from pathlib import Path
 from dotenv import load_dotenv
 
+# --- ⚙️ الإعدادات العامة والتكوين ---
+
+# تحميل متغيرات البيئة من ملف .env (خاصة مفتاح API)
 load_dotenv()
+API_KEY = os.getenv("API_KEY")
 
-class Config:
-    VERSION = "v2.1.0"
-    BASE_DIR = Path(__file__).resolve().parent.parent
-    DATA_DIR = BASE_DIR / "data"
-    MODELS_DIR = BASE_DIR / "models"
+# إصدار المشروع (مفيد للتتبع)
+VERSION = "2.0.0"
 
-    # API
-    API_KEY = os.getenv("FOOTBALL_DATA_API_KEY")
-    BASE_URL = "https://api.football-data.org/v4"
-    MAX_RETRIES = 5
-    TIMEOUT = 25
-    MIN_INTERVAL_SEC = 6.2
+# الشهر الذي تبدأ فيه معظم المواسم الأوروبية (يوليو)، يُستخدم بواسطة app.py
+CURRENT_SEASON_START_MONTH = 7
 
-    # Modeling
-    PRIOR_GAMES = 12
-    HALF_LIFE_DAYS = 270
-    DC_RHO_MAX = 0.3
+# المسارات الأساسية للمشروع
+BASE_DIR = Path(__file__).resolve().parent.parent
+DATA_DIR = BASE_DIR / "data"
+MODELS_DIR = BASE_DIR / "models"
 
-    # ELO
-    ELO_K = 20.0
-    ELO_HFA = 60.0
-    ELO_LAMBDA_SCALE = 1200.0  # لتعديل λ اختيارياً حسب الفارق في ELO
+# التأكد من وجود مجلدات البيانات والنماذج وإنشائها عند الحاجة
+MODELS_DIR.mkdir(exist_ok=True, parents=True)
+DATA_DIR.mkdir(exist_ok=True, parents=True)
 
-    # Competitions
-    TARGET_COMPETITIONS = ["PL", "PD", "SA", "BL1", "FL1", "CL", "DED", "PPL", "BSA"]
-    COMPETITION_PRIORITY = ["CL", "PD", "PL", "SA", "BL1", "FL1", "DED", "PPL", "BSA"]
 
-    # Seasons
-    CURRENT_SEASON_START_MONTH = 7  # يوليو
+# --- 🌐 إعدادات واجهة برمجة التطبيقات (API) ---
 
-    def __init__(self):
-        # إنشاء المجلدات إن لم تكن موجودة
-        self.DATA_DIR.mkdir(parents=True, exist_ok=True)
-        self.MODELS_DIR.mkdir(parents=True, exist_ok=True)
+BASE_URL = "https://api.football-data.org/v4"
+TIMEOUT = 30  # مهلة الطلب بالثواني
+MAX_RETRIES = 5 # أقصى عدد مرات لإعادة المحاولة عند الفشل
 
-        # فرض وجود المفتاح لتقليل الأخطاء في وقت التشغيل
-        if not self.API_KEY:
-            raise ValueError("API Key not found. Please set FOOTBALL_DATA_API_KEY in your .env file.")
 
-config = Config()
+# --- ⚽ الدوريات المستهدفة ---
+
+# **ملاحظة هامة**: هذه هي القائمة الرئيسية التي يجب عليك تعديلها.
+# أضف رموز الدوريات التي ترغب في تحليلها.
+# تأكد من أن خطتك على موقع football-data.org تسمح بالوصول لهذه الدوريات.
+TARGET_COMPETITIONS = [
+    'PL',   # الدوري الإنجليزي الممتاز
+    'BL1',  # الدوري الألماني (بوندسليجا)
+    'SA',   # الدوري الإيطالي (سيريا أي)
+    'PD',   # الدوري الإسباني (لا ليجا)
+    'FL1',  # الدوري الفرنسي (ليج 1)
+    'PPL'   # الدوري البرتغالي
+]
+
+
+# --- 🧠 إعدادات النمذجة الإحصائية ---
+
+# عمر النصف (بالأيام): وزن المباريات القديمة ينخفض إلى النصف كل 120 يومًا
+HALF_LIFE_DAYS = 120
+
+# المباريات الافتراضية: عدد المباريات الوهمية لإعطاء استقرار للتقييمات في بداية الموسم
+PRIOR_GAMES = 10
+
+# أقصى قيمة لمعامل الارتباط "Rho" في نموذج Dixon-Coles
+DC_RHO_MAX = 0.25
+
+
+# --- ✨ إعدادات نموذج ELO ---
+
+# معامل التحديث (K-factor): مدى تأثر التصنيف بنتيجة مباراة واحدة
+ELO_K = 20.0
+
+# أفضلية الملعب (بالنقاط): عدد نقاط Elo الإضافية التي يحصل عليها الفريق المضيف
+ELO_HFA = 65.0
+
+# معامل ضبط تأثير Elo: يُستخدم في app.py لتعديل الأهداف المتوقعة بناءً على فارق Elo
+ELO_LAMBDA_SCALE = 800.0

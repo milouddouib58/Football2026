@@ -1,100 +1,96 @@
-# common/utils.py
-import re
-import math
-import difflib
-from datetime import datetime
-from typing import Optional, Tuple, Dict, List
+# common/utils.py (النسخة المحدثة)
 
-from .config import config
+import json
+from datetime import datetime, timezone
+from typing import Optional, Tuple, Dict, Any, List
 
-ARABIC_SYNONYMS = {
-    "ريال مدريد": "Real Madrid", "برشلونة": "Barcelona", "برشلونه": "Barcelona",
-    "اتلتيكو مدريد": "Atletico Madrid", "أتلتيكو مدريد": "Atletico Madrid",
-    "إشبيلية": "Sevilla", "اشبيلية": "Sevilla", "مانشستر سيتي": "Manchester City",
-    "مان سيتي": "Manchester City", "مانشستر يونايتد": "Manchester United",
-    "ليفربول": "Liverpool", "تشيلسي": "Chelsea", "توتنهام": "Tottenham Hotspur",
-    "أرسنال": "Arsenal", "بايرن ميونخ": "Bayern Munich", "بايرن ميونيخ": "Bayern Munich",
-    "بوروسيا دورتموند": "Borussia Dortmund", "باريس سان جيرمان": "Paris Saint-Germain",
+# --- [إضافة جديدة] قاموس للأسماء العربية الشائعة ---
+ARABIC_TEAM_NAMES_MAP = {
+    "ريال مدريد": "real madrid",
+    "برشلونة": "fc barcelona",
+    "أتلتيكو مدريد": "atlético de madrid",
+    "ليفربول": "liverpool fc",
+    "مانشستر سيتي": "manchester city fc",
+    "مانشستر يونايتد": "manchester united fc",
+    "ارسنال": "arsenal fc",
+    "أرسنال": "arsenal fc",
+    "تشيلسي": "chelsea fc",
+    "بايرن ميونخ": "fc bayern münchen",
+    "بوروسيا دورتموند": "borussia dortmund",
+    "يوفنتوس": "juventus",
+    "ميلان": "ac milan",
+    "انتر ميلان": "inter",
+    "باريس سان جيرمان": "paris saint-germain",
 }
 
-def log(msg: str, level: str = "INFO"):
+# --- دوال موجودة سابقًا (تبقى كما هي) ---
+def log(message: str, level: str = "INFO"):
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    print(f"[{timestamp}] [{level}] {msg}", flush=True)
+    print(f"{timestamp} [{level.upper()}] - {message}")
 
-def parse_date_safe(date_str: str) -> Optional[datetime]:
+def parse_date_safe(date_str: Optional[str]) -> Optional[datetime]:
     if not date_str:
         return None
     try:
-        return datetime.fromisoformat(date_str.replace("Z", "+00:00"))
+        return datetime.fromisoformat(date_str.replace('Z', '+00:00')).astimezone(timezone.utc)
     except (ValueError, TypeError):
         return None
 
 def parse_score(match: Dict) -> Tuple[Optional[int], Optional[int]]:
-    score = match.get("score", {}).get("fullTime", {})
-    return score.get("home"), score.get("away")
+    score = match.get('score', {}).get('fullTime', {})
+    hg = score.get('home')
+    ag = score.get('away')
+    if hg is not None and ag is not None:
+        return int(hg), int(ag)
+    return None, None
 
 def poisson_pmf(k: int, lam: float) -> float:
-    if lam <= 0:
-        return 1.0 if k == 0 else 0.0
+    import math
+    if lam < 0 or k < 0:
+        return 0.0
     try:
-        return math.exp(k * math.log(lam) - lam - math.lgamma(k + 1))
-    except (ValueError, OverflowError):
+        return (lam ** k * math.exp(-lam)) / math.factorial(k)
+    except (OverflowError, ValueError):
         return 0.0
 
-def _norm_ascii(s: str) -> str:
-    s = (s or "").lower()
-    s = re.sub(r"[^a-z0-9\s]", " ", s)
-    return re.sub(r"\s+", " ", s).strip()
-
-def _remove_ar_diacritics(s: str) -> str:
-    # إزالة التشكيل إن وجد
-    return re.sub(r'[\u064B-\u0652]', '', s)
-
-def transliterate_ar_to_en(s: str) -> str:
-    ar_to_latin = {
-        "ا":"a","أ":"a","إ":"i","آ":"a","ؤ":"u","ئ":"i","ب":"b","ت":"t","ث":"th",
-        "ج":"j","ح":"h","خ":"kh","د":"d","ذ":"dh","ر":"r","ز":"z","س":"s","ش":"sh",
-        "ص":"s","ض":"d","ط":"t","ظ":"z","ع":"a","غ":"gh","ف":"f","ق":"q","ك":"k",
-        "ل":"l","م":"m","ن":"n","ه":"h","و":"w","ي":"y","ى":"y","ة":"a",
-    }
-    s = _remove_ar_diacritics(s or "")
-    s_norm = re.sub(r'[^\u0600-\u06FF\s]', '', s)
-    out = "".join([ar_to_latin.get(ch, ch) for ch in s_norm])
-    return _norm_ascii(out)
-
-def enhanced_team_search(team_name: str, teams_map: Dict, prefer_comp: Optional[str] = None) -> Optional[int]:
-    clean_name = (team_name or "").strip()
-    if len(clean_name) < 2:
+# --- [إضافة جديدة] دالة البحث الذكي عن الفرق ---
+def enhanced_team_search(
+    query: str, teams_map: Dict[str, Dict], comp_code: str = None
+) -> Optional[int]:
+    """
+    يبحث عن ID الفريق بناءً على اسم البحث.
+    يدعم الأسماء العربية والبحث الجزئي والحساس لحالة الأحرف.
+    """
+    if not query or not teams_map:
         return None
 
-    # مرادفات عربية مباشرة
-    ar_key = clean_name.replace("ى", "ي").replace("ة", "ه")
-    if ar_key in ARABIC_SYNONYMS:
-        clean_name = ARABIC_SYNONYMS[ar_key]
+    query_lower = query.strip().lower()
 
-    best_score, best_id = 0.0, None
-    tname_norm = clean_name.lower()
-    tname_trans = transliterate_ar_to_en(clean_name)
+    # 1. التحقق من القاموس العربي
+    if query_lower in ARABIC_TEAM_NAMES_MAP:
+        query_lower = ARABIC_TEAM_NAMES_MAP[query_lower]
 
-    teams_to_search: List[Dict] = list(teams_map.values())
-    if prefer_comp and prefer_comp in config.COMPETITION_PRIORITY:
-        preferred = [t for t in teams_to_search if prefer_comp in t.get('competitions', [])]
-        others = [t for t in teams_to_search if prefer_comp not in t.get('competitions', [])]
-        teams_to_search = preferred + others
-
-    for team_data in teams_to_search:
-        tid = team_data.get('id')
-        all_names = [n for n in team_data.get('names', []) if n]
-
+    # قائمة المرشحين المحتملين
+    candidates = []
+    for team_id, team_data in teams_map.items():
+        # التأكد من أن الفريق يلعب في الدوري المطلوب (إذا تم تحديده)
+        if comp_code and comp_code not in team_data.get("competitions", []):
+            continue
+        
+        all_names = [n.lower() for n in team_data.get("names", []) if n]
+        
+        # 2. البحث عن تطابق كامل (case-insensitive)
+        if query_lower in all_names:
+            candidates.append((team_id, 100)) # أعلى أولوية
+        
+        # 3. البحث عن تطابق جزئي
         for name in all_names:
-            score = difflib.SequenceMatcher(None, tname_norm, (name or "").lower()).ratio()
-            if score > best_score:
-                best_score, best_id = score, tid
+            if query_lower in name:
+                candidates.append((team_id, 50)) # أولوية متوسطة
 
-        if tname_trans:
-            for name in all_names:
-                score = difflib.SequenceMatcher(None, tname_trans, _norm_ascii(name or "")).ratio()
-                if score > best_score:
-                    best_score, best_id = score, tid
+    if not candidates:
+        return None
 
-    return best_id if best_score > 0.65 else None
+    # فرز المرشحين حسب الأولوية وإرجاع الأفضل
+    candidates.sort(key=lambda x: x[1], reverse=True)
+    return int(candidates[0][0])
