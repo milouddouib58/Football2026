@@ -1,4 +1,4 @@
-# common/modeling.py (النسخة المحسنة)
+# common/modeling.py (النسخة الكاملة والمصححة)
 
 import math
 from datetime import datetime
@@ -7,13 +7,10 @@ from typing import Dict, List, Tuple, Any
 # يتطلب تثبيت: pip install scipy
 from scipy.optimize import minimize
 
-
+# --- ✅ تم إصلاح هذا الجزء لضمان استقرار الاستيراد ---
 from common import config
-
-from .utils import parse_date_safe, parse_score, poisson_pmf
-
-
-# --- 1. التحسينات الأساسية المدمجة ---
+from common.utils import parse_date_safe, parse_score, poisson_pmf
+# ----------------------------------------------------
 
 def ewma_weight(delta_days: float, half_life_days: float) -> float:
     """
@@ -156,8 +153,6 @@ def fit_dc_rho_mle(matches: List[Dict], A: Dict, D: Dict, league_avgs: Dict) -> 
     )
     return float(result.x[0]) if result.success else 0.0
 
-
-# --- 2. دوال مساعدة للتنبؤ (موجودة سابقًا) ---
 def poisson_matrix_dc(lh: float, la: float, rho: float, max_goals: int = 8) -> List[List[float]]:
     pX = [poisson_pmf(i, lh) for i in range(max_goals + 1)]
     pY = [poisson_pmf(j, la) for j in range(max_goals + 1)]
@@ -180,8 +175,6 @@ def matrix_to_outcomes(M: List[List[float]]) -> Tuple[float, float, float]:
     p_away = 1.0 - p_home - p_draw
     return p_home, p_draw, p_away
 
-
-# --- 3. [إضافة جديدة] هندسة ميزات "الفورمة" ---
 def calculate_team_form(
     all_matches: List[Dict], team_id: int, on_date: datetime, num_matches: int = 5
 ) -> Dict[str, Any]:
@@ -191,7 +184,7 @@ def calculate_team_form(
     team_matches = []
     for m in all_matches:
         dt = parse_date_safe(m.get("utcDate"))
-        if not dt or dt >= on_date: # تجاهل المباريات المستقبلية
+        if not dt or dt >= on_date:
             continue
         h_id, a_id = m.get("homeTeam", {}).get("id"), m.get("awayTeam", {}).get("id")
         if team_id in (h_id, a_id):
@@ -203,7 +196,7 @@ def calculate_team_form(
     last_n_matches = team_matches_sorted[:num_matches]
 
     if not last_n_matches:
-        return {"matches_analyzed": 0, "avg_points": 1.0} # قيمة افتراضية
+        return {"matches_analyzed": 0, "avg_points": 1.0}
 
     points = 0
     for m in last_n_matches:
@@ -219,3 +212,19 @@ def calculate_team_form(
         "matches_analyzed": len(last_n_matches),
         "avg_points": round(points / len(last_n_matches), 2)
     }
+
+# --- ✅ تم إضافة الدالة المفقودة هنا ---
+def top_scorelines(matrix: List[List[float]], top_k: int = 5) -> List[Tuple[int, int, float]]:
+    """
+    يستخرج أعلى K نتائج متوقعة من مصفوفة الاحتمالات.
+    """
+    flat_list = []
+    for i in range(len(matrix)):
+        for j in range(len(matrix[0])):
+            flat_list.append((i, j, matrix[i][j]))
+    
+    # فرز النتائج من الأعلى إلى الأقل احتمالاً
+    flat_list.sort(key=lambda x: x[2], reverse=True)
+    
+    return flat_list[:top_k]
+# ------------------------------------
