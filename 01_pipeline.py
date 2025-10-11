@@ -1,13 +1,13 @@
 # 01_pipeline.py
 import json
 import argparse
-from datetime import datetime
 from common.config import config
 from common.api_client import APIClient
 from common.utils import log
 
-def run_pipeline(years_to_fetch: int = 15):
-    log("--- Starting Data Pipeline ---", "INFO")
+def run_pipeline():
+    log("--- Starting Data Pipeline (Free Tier Compatible) ---", "INFO")
+    log("NOTE: This script will only fetch finished matches from the CURRENT season.", "WARNING")
     client = APIClient()
 
     target_comps = client.get_competitions()
@@ -15,25 +15,29 @@ def run_pipeline(years_to_fetch: int = 15):
         log("Could not fetch competitions. Exiting.", "CRITICAL")
         return
 
-    current_year = datetime.now().year
-    years = range(current_year, current_year - years_to_fetch, -1)
-
     all_matches = {}
+    # تم تغيير الحلقة لتناسب الخطة المجانية: لا نطلب سنوات ماضية
     for code, comp_id in target_comps.items():
-        for year in years:
-            log(f"Fetching matches for {code} in {year}...")
-            matches_in_year = client.get_matches_for_year(year, comp_id)
-            if matches_in_year:
-                log(f"Found {len(matches_in_year)} matches.")
-                for match in matches_in_year:
-                    all_matches[match['id']] = match
+        log(f"Fetching current season matches for {code}...")
+        # استدعاء الدالة الجديدة التي تعمل مع الخطة المجانية
+        current_matches = client.get_current_matches_for_competition(comp_id)
+        if current_matches:
+            log(f"Found {len(current_matches)} finished matches.")
+            for match in current_matches:
+                all_matches[match['id']] = match
+        else:
+            log(f"No finished matches found for {code} in the current season via API.")
 
     log(f"Total unique matches collected: {len(all_matches)}")
+    if not all_matches:
+        log("No match data was collected. This might be because no matches have finished yet in the current season.", "CRITICAL")
+
     output_path = config.DATA_DIR / "matches.json"
     with open(output_path, 'w', encoding='utf-8') as f:
         json.dump(list(all_matches.values()), f, ensure_ascii=False, indent=2)
     log(f"Match data saved to {output_path}")
-
+    
+    # لا داعي لإيقاف السكريبت، جلب الفرق لا يزال مفيدًا
     teams_data = client.get_teams_for_competitions(list(target_comps.values()))
     teams_path = config.DATA_DIR / "teams.json"
     with open(teams_path, 'w', encoding='utf-8') as f:
@@ -43,7 +47,7 @@ def run_pipeline(years_to_fetch: int = 15):
     log("--- Data Pipeline Finished ---", "INFO")
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Build local dataset from football-data.org")
-    parser.add_argument("--years", type=int, default=15, help="How many past years to fetch per competition.")
+    # تم حذف خيار --years لأنه لم يعد له استخدام في هذه الطريقة
+    parser = argparse.ArgumentParser(description="Build local dataset from football-data.org (Free Tier Compatible)")
     args = parser.parse_args()
-    run_pipeline(years_to_fetch=args.years)
+    run_pipeline()
