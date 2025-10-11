@@ -1,2 +1,170 @@
-# -*- coding: utf-8 -*- # app.py — إصلاح جذري للاستيراد: بدائل محلية + استيراد ديناميكي + مسارات مرنة import sys import os import json import math import subprocess import difflib import importlib from dataclasses import dataclass from pathlib import Path from datetime import datetime from typing import Dict, List, Tuple, Optional import streamlit as st # ----------------------------------------------------------------------------- # إعداد الصفحة (يجب أن يكون قبل أي عنصر UI) # ----------------------------------------------------------------------------- st.set_page_config(page_title="⚽ Football Predictor", page_icon="⚽", layout="wide") # ----------------------------------------------------------------------------- # مسارات المشروع: تأكد أن مجلد المشروع وجذوره في sys.path # ----------------------------------------------------------------------------- APP_ROOT = Path(__file__).resolve().parent def _ensure_in_syspath(p: Path): try: if p and p.exists(): s = str(p) if s not in sys.path: sys.path.insert(0, s) except Exception: pass _ensure_in_syspath(APP_ROOT) _ensure_in_syspath(APP_ROOT.parent) _ensure_in_syspath(APP_ROOT.parent.parent) # ----------------------------------------------------------------------------- # Fallback Config في حال تعذّر استيراد common.config # ----------------------------------------------------------------------------- try: _cfg_mod = importlib.import_module("common.config") config = _cfg_mod CONFIG_SOURCE = "common.config" except Exception as e: @dataclass class _FallbackConfig: VERSION: str = "app-1.1" CURRENT_SEASON_START_MONTH: int = 7 ELO_HFA: float = 60.0 ELO_LAMBDA_SCALE: float = 400.0 TARGET_COMPETITIONS: Tuple[str, ...] = tuple() DATA_DIR: Path = APP_ROOT / "data" MODELS_DIR: Path = APP_ROOT / "models" config = _FallbackConfig() CONFIG_SOURCE = f"fallback ({e.__class__.__name__}: {e})" # ----------------------------------------------------------------------------- # أدوات المسارات والملفات # ----------------------------------------------------------------------------- def _dir_from_env(var_name: str) -> Optional[Path]: v = os.getenv(var_name) if v: p = Path(v) if p.exists(): return p return None def _first_existing_file(filename: str, candidates: List[Path]) -> Optional[Path]: for d in candidates: if not d: continue p = Path(d) / filename if p.exists(): return p return None def _data_dir_candidates() -> List[Path]: return [ getattr(config, "DATA_DIR", None), _dir_from_env("DATA_DIR"), APP_ROOT / "data", APP_ROOT.parent / "data", APP_ROOT / "datasets", APP_ROOT / "resources", ] def _models_dir_candidates() -> List[Path]: return [ getattr(config, "MODELS_DIR", None), _dir_from_env("MODELS_DIR"), APP_ROOT / "models", APP_ROOT.parent / "models", APP_ROOT / "artifacts", APP_ROOT / "checkpoints", ] # ----------------------------------------------------------------------------- # Fallback للبحث عن الفريق إذا تعذّر استيراد common.utils.enhanced_team_search # ----------------------------------------------------------------------------- def _normalize_arabic(s: str) -> str: s = s.replace("أ", "ا").replace("إ", "ا").replace("آ", "ا") s = s.replace("ى", "ي").replace("ة", "ه").replace("ؤ", "و").replace("ئ", "ي") for ch in ["َ","ً","ُ","ٌ","ِ","ٍ","ْ","ّ"]: s = s.replace(ch, "") return s def _normalize_name(s: str) -> str: s = (s or "").strip().lower() s = _normalize_arabic(s) out = [] for ch in s: if ch.isalnum() or ch.isspace(): out.append(ch) return " ".join("".join(out).split()) def _similarity(a: str, b: str) -> float: if not a or not b: return 0.0 if a == b: return 1.0 if a in b or b in a: return 0.92 return difflib.SequenceMatcher(None, a, b).ratio() try: _utils_mod = importlib.import_module("common.utils") if hasattr(_utils_mod, "enhanced_team_search"): enhanced_team_search = _utils_mod.enhanced_team_search ENHANCED_SEARCH_SOURCE = "common.utils" else: raise AttributeError("enhanced_team_search missing in common.utils") except Exception as e: ENHANCED_SEARCH_SOURCE = f"fallback ({e.__class__.__name__}: {e})" def enhanced_team_search(query: str, teams_map: Dict, comp_code: Optional[str] = None) -> Optional[int]: if not query or not teams_map: return None q = _normalize_name(query) best_id, best_score = None, -1.0 for t in teams_map.values(): tid = t.get("id") if not tid: continue names = t.get("names") or [] comps = t.get("competitions") or [] comp_bonus = 0.2 if (comp_code and comp_code in comps) else 0.0 for name in names: s = _similarity(q, _normalize_name(name)) + comp_bonus if s > best_score: best_score, best_id = s, tid return best_id # ----------------------------------------------------------------------------- # Fallback محلي كامل لـ Poisson + Dixon–Coles إذا تعذّر/نقص common.modeling # ----------------------------------------------------------------------------- def _builtin_poisson_probs(lam: float, max_goals: int) -> List[float]: lam = max(lam, 1e-12) probs = [0.0] * (max_goals + 1) probs[0] = math.exp(-lam) for k in range(1, max_goals + 1): probs[k] = probs[k - 1] * lam / k return probs def _builtin_dc_tau(i: int, j: int, lam_h: float, lam_a: float, rho: float) -> float: if abs(rho) < 1e-12: return 1.0 if i == 0 and j == 0: return max(0.0, 1.0 - lam_h * lam_a * rho) if i == 0 and j == 1: return max(0.0, 1.0 + lam_h * rho) if i == 1 and j == 0: return max(0.0, 1.0 + lam_a * rho) if i == 1 and j == 1: return max(0.0, 1.0 - rho) return 1.0 def _builtin_poisson_matrix_dc(lam_home: float, lam_away: float, rho: float, max_goals: int = 8) -> List[List[float]]: ph = _builtin_poisson_probs(lam_home, max_goals) pa = _builtin_poisson_probs(lam_away, max_goals) mat = [[ph[i] * pa[j] for j in range(max_goals + 1)] for i in range(max_goals + 1)] # Dixon–Coles تصحيح للخلايا القريبة من الصفر for i in range(min(2, max_goals + 1)): for j in range(min(2, max_goals + 1)): mat[i][j] *= _builtin_dc_tau(i, j, lam_home, lam_away, rho) total = sum(sum(row) for row in mat) if total > 0: for i in range(max_goals + 1): for j in range(max_goals + 1): mat[i][j] /= total return mat def _builtin_matrix_to_outcomes(matrix: List[List[float]]) -> Tuple[float, float, float]: n = len(matrix) p_home = p_draw = p_away = 0.0 for i in range(n): for j in range(n): p = matrix[i][j] if i > j: p_home += p elif i == j: p_draw += p else: p_away += p total = p_home + p_draw + p_away if total > 0: p_home, p_draw, p_away = p_home / total, p_draw / total, p_away / total return p_home, p_draw, p_away def _builtin_top_scorelines(matrix: List[List[float]], top_k: int = 5) -> List[Tuple[int, int, float]]: flat: List[Tuple[int, int, float]] = [] n = len(matrix) for i in range(n): for j in range(n): flat.append((i, j, matrix[i][j])) flat.sort(key=lambda x: x[2], reverse=True) return flat[:top_k] # حاول استيراد common.modeling ديناميكيًا، لكن لا تعتمد على from ... import try: _modeling_mod = importlib.import_module("common.modeling") MODELING_SOURCE = "common.modeling" except Exception as e: _modeling_mod = None MODELING_SOURCE = f"not-imported ({e.__class__.__name__}: {e})" # مغلفات تستخدم ما يتوفر من common.modeling وإلا fallback محلي MODELING_RUNTIME_SOURCES = {"poisson_matrix_dc": None, "matrix_to_outcomes": None, "top_scorelines": None} def poisson_matrix_dc(lam_home: float, lam_away: float, rho: float, max_goals: int = 8) -> List[List[float]]: if _modeling_mod and hasattr(_modeling_mod, "poisson_matrix_dc"): try: res = _modeling_mod.poisson_matrix_dc(lam_home, lam_away, rho, max_goals=max_goals) MODELING_RUNTIME_SOURCES["poisson_matrix_dc"] = "common.modeling" return res except Exception: pass MODELING_RUNTIME_SOURCES["poisson_matrix_dc"] = "builtin" return _builtin_poisson_matrix_dc(lam_home, lam_away, rho, max_goals=max_goals) def matrix_to_outcomes(matrix: List[List[float]]) -> Tuple[float, float, float]: if _modeling_mod and hasattr(_modeling_mod, "matrix_to_outcomes"): try: res = _modeling_mod.matrix_to_outcomes(matrix) MODELING_RUNTIME_SOURCES["matrix_to_outcomes"] = "common.modeling" return res except Exception: pass MODELING_RUNTIME_SOURCES["matrix_to_outcomes"] = "builtin" return _builtin_matrix_to_outcomes(matrix) def top_scorelines(matrix: List[List[float]], top_k: int = 5) -> List[Tuple[int, int, float]]: if _modeling_mod and hasattr(_modeling_mod, "top_scorelines"): try: res = _modeling_mod.top_scorelines(matrix, top_k=top_k) MODELING_RUNTIME_SOURCES["top_scorelines"] = "common.modeling" return res except Exception: pass MODELING_RUNTIME_SOURCES["top_scorelines"] = "builtin" return _builtin_top_scorelines(matrix, top_k=top_k) # ----------------------------------------------------------------------------- # تحميل البيانات والنماذج # ----------------------------------------------------------------------------- @st.cache_data def _load_json(path: Path) -> Optional[dict]: try: if path and path.exists(): with open(path, "r", encoding="utf-8") as f: return json.load(f) except Exception: pass return None @st.cache_data def load_teams_map() -> Optional[Dict]: p = _first_existing_file("teams.json", _data_dir_candidates()) return _load_json(p) if p else None @st.cache_data def load_models() -> Dict[str, dict]: out: Dict[str, dict] = {} files = { "averages": "league_averages.json", "factors": "team_factors.json", "elo": "elo_ratings.json", "rho": "rho_values.json", } for key, fname in files.items(): p = _first_existing_file(fname, _models_dir_candidates()) out[key] = _load_json(p) or {} return out # ----------------------------------------------------------------------------- # أدوات مساعدة للنصوص والفرق # ----------------------------------------------------------------------------- def current_season_year(now: datetime) -> int: start_m = getattr(config, "CURRENT_SEASON_START_MONTH", 7) return now.year if now.month >= start_m else now.year - 1 def _primary_name(names: List[str]) -> str: names = [n for n in (names or []) if n] if not names: return "Unknown" def score(n: str) -> Tuple[int, int, int]: return (int(" " in n), len(n), -int(n.isupper())) return sorted(names, key=score, reverse=True)[0] def teams_for_comp(teams_map: Dict, comp_code: str) -> List[Tuple[str, int]]: out: List[Tuple[str, int]] = [] for t in teams_map.values(): comps = t.get("competitions", []) or [] if comp_code in comps: out.append((_primary_name(t.get("names", [])), t.get("id"))) out = [(name, tid) for name, tid in out if tid] out.sort(key=lambda x: x[0].lower()) return out def run_pipeline_cli(years: int) -> Tuple[bool, str]: cmd = [sys.executable, str(APP_ROOT / "01_pipeline.py"), "--years", str(years)] try: result = subprocess.run(cmd, capture_output=True, text=True, check=False) ok = (result.returncode == 0) output = (result.stdout or "") + "\n" + (result.stderr or "") return ok, output except Exception as e: return False, f"Failed to run pipeline: {e}" def run_trainer_cli() -> Tuple[bool, str]: cmd = [sys.executable, str(APP_ROOT / "02_trainer.py")] try: result = subprocess.run(cmd, capture_output=True, text=True, check=False) ok = (result.returncode == 0) output = (result.stdout or "") + "\n" + (result.stderr or "") return ok, output except Exception as e: return False, f"Failed to run trainer: {e}" # ----------------------------------------------------------------------------- # التنبؤ # ----------------------------------------------------------------------------- def compute_prediction( team1_name: str, team2_name: str, comp_code: str, use_elo: bool, topk: int, ) -> Tuple[dict, List[List[float]]]: teams_map = load_teams_map() if not teams_map: raise RuntimeError("Teams map not found. Please run the data pipeline first (01_pipeline.py).") home_id = enhanced_team_search(team1_name, teams_map, comp_code) away_id = enhanced_team_search(team2_name, teams_map, comp_code) if not home_id or not away_id: raise ValueError(f"Could not find one or both teams: '{team1_name}', '{team2_name}'") season_year = current_season_year(datetime.now()) season_key = f"{comp_code}_{season_year}" last_season_key = f"{comp_code}_{season_year - 1}" models = load_models() # ELO if season_key not in models["elo"]: season_key = last_season_key if season_key not in models["elo"]: raise RuntimeError(f"No recent model available for competition {comp_code}. Train models first.") elo = models["elo"].get(season_key, {}) elo_home = float(elo.get(str(home_id), 1500.0)) elo_away = float(elo.get(str(away_id), 1500.0)) # Factors factors = models["factors"].get(season_key, {}) home_attack = float(factors.get("attack", {}).get(str(home_id), 1.0)) home_defense = float(factors.get("defense", {}).get(str(home_id), 1.0)) away_attack = float(factors.get("attack", {}).get(str(away_id), 1.0)) away_defense = float(factors.get("defense", {}).get(str(away_id), 1.0)) # Averages avgs = models["averages"].get(season_key, {}) avg_home = float(avgs.get("avg_home_goals", 1.4)) avg_away = float(avgs.get("avg_away_goals", 1.1)) # Rho rho = float(models["rho"].get(season_key, 0.0)) # Lambdas lam_home = home_attack * away_defense * avg_home lam_away = away_attack * home_defense * avg_away if use_elo: elo_hfa = getattr(config, "ELO_HFA", 60.0) elo_scale = getattr(config, "ELO_LAMBDA_SCALE", 400.0) edge = (elo_home - elo_away) + elo_hfa factor = 10 ** (edge / float(elo_scale)) lam_home = lam_home * factor lam_away = max(1e-9, lam_away / factor) matrix = poisson_matrix_dc(lam_home, lam_away, rho, max_goals=8) p_home, p_draw, p_away = matrix_to_outcomes(matrix) result = { "meta": {"version": getattr(config, "VERSION", "app-1.1"), "model_season_used": season_key}, "match": f"{team1_name} (Home) vs {team2_name} (Away)", "competition": comp_code, "teams_found": {"home": {"name": team1_name, "id": home_id}, "away": {"name": team2_name, "id": away_id}}, "model_inputs": { "lambda_home": round(lam_home, 3), "lambda_away": round(lam_away, 3), "rho": round(rho, 3), "use_elo_adjust": use_elo, }, "probabilities": {"home_win": p_home, "draw": p_draw, "away_win": p_away}, } if topk and topk > 0: tops = top_scorelines(matrix, top_k=topk) result["top_scorelines"] = [{"home_goals": i, "away_goals": j, "prob": p} for i, j, p in tops] return result, matrix def _competition_options() -> List[str]: target = getattr(config, "TARGET_COMPETITIONS", None) or () if target: return list(target) tm = load_teams_map() if not tm: return [] comps = set() for t in tm.values(): for c in t.get("competitions", []) or []: comps.add(c) return sorted(comps) # ----------------------------------------------------------------------------- # واجهة المستخدم # ----------------------------------------------------------------------------- st.title("⚽ Football Predictor — Streamlit UI") st.caption("Dixon–Coles + Team Factors + ELO (Arabic-enabled team search)") with st.sidebar: st.header("إدارة البيانات والنماذج") st.markdown("- شغّل Pipeline أولًا لبناء البيانات، ثم درّب النماذج.") years = st.number_input("عدد السنوات المطلوب جلبها لكل مسابقة", min_value=1, max_value=20, value=5, step=1) if st.button("تشغيل بناء البيانات (Pipeline)"): with st.spinner("جارٍ بناء قاعدة البيانات... قد يستغرق وقتًا"): ok, logs = run_pipeline_cli(years) st.cache_data.clear() if ok: st.success("تم بناء البيانات بنجاح") else: st.error("فشل بناء البيانات") with st.expander("عرض السجلات"): st.code(logs) if st.button("تدريب النماذج (Trainer)"): with st.spinner("جارٍ تدريب النماذج..."): ok, logs = run_trainer_cli() st.cache_data.clear() if ok: st.success("تم تدريب النماذج بنجاح") else: st.error("فشل تدريب النماذج") with st.expander("عرض السجلات"): st.code(logs) st.divider() use_elo = st.checkbox("تفعيل تعديل ELO في λ", value=False) topk = st.slider("أظهر أعلى K من النتائج المحتملة (scorelines)", min_value=0, max_value=10, value=5) if st.button("تحديث الكاش"): st.cache_data.clear() st.success("تم مسح الكاش") with st.expander("معلومات تشخيصية (Debug)"): st.markdown(f"- config source: {CONFIG_SOURCE}") st.markdown(f"- team search: {ENHANCED_SEARCH_SOURCE}") st.markdown(f"- modeling module: {MODELING_SOURCE}") st.markdown(f"- last-used modeling fns: {MODELING_RUNTIME_SOURCES}") st.markdown(f"- APP_ROOT: {APP_ROOT}") st.markdown(f"- sys.path[:5]: {sys.path[:5]}") teams_path = _first_existing_file("teams.json", _data_dir_candidates()) st.markdown(f"- teams.json: {teams_path if teams_path else 'NOT FOUND'}") for fname in ["league_averages.json", "team_factors.json", "elo_ratings.json", "rho_values.json"]: p = _first_existing_file(fname, _models_dir_candidates()) st.markdown(f"- {fname}: {p if p else 'NOT FOUND'}") st.subheader("التنبؤ بالمباراة") comp_options = _competition_options() if not comp_options: st.warning("لم يتم العثور على مسابقات. شغّل Pipeline أولًا أو تأكد من وجود teams.json.") comp_code = st.text_input("أدخل رمز المسابقة يدويًا", value="ENG1") else: comp_code = st.selectbox("اختر المسابقة", options=comp_options, index=0) mode = st.radio("طريقة إدخال الفرق", options=["اختيار من القائمة", "كتابة الأسماء"], horizontal=True) team1_name, team2_name = "", "" selected_home_id, selected_away_id = None, None teams_map = load_teams_map() if mode == "اختيار من القائمة": if not teams_map: st.warning("لا توجد بيانات فرق محلية. شغّل بناء البيانات أولًا.") else: comp_teams = teams_for_comp(teams_map, comp_code) if comp_code else [] if not comp_teams: st.warning("لم يتم العثور على فرق لهذه المسابقة. تأكد من تشغيل Pipeline للمسابقات المستهدفة.") else: names = [n for n, _ in comp_teams] name_to_id = {n: tid for n, tid in comp_teams} c1, c2 = st.columns(2) with c1: team1_name = st.selectbox("الفريق المضيف", options=names, index=0 if names else 0) selected_home_id = name_to_id.get(team1_name) with c2: default_away_idx = 1 if len(names) > 1 else 0 team2_name = st.selectbox("الفريق الضيف", options=names, index=default_away_idx) selected_away_id = name_to_id.get(team2_name) if selected_home_id == selected_away_id: st.info("اختر فريقين مختلفين من فضلك.") else: c1, c2 = st.columns(2) with c1: team1_name = st.text_input("اسم الفريق المضيف", value="Manchester City", help="يمكن إدخال اسم عربي مثل 'ريال مدريد'") with c2: team2_name = st.text_input("اسم الفريق الضيف", value="Arsenal", help="يمكن إدخال اسم عربي مثل 'برشلونة'") if st.button("احسب التنبؤ الآن"): try: if not team1_name or not team2_name: st.warning("يرجى تحديد/كتابة اسمي الفريقين.") st.stop() result, matrix = compute_prediction( team1_name, team2_name, comp_code, use_elo=use_elo, topk=topk ) st.markdown( f"### {result['match']} — {result['competition']} | الموسم المستخدم: {result['meta']['model_season_used']}" ) p_home = result["probabilities"]["home_win"] p_draw = result["probabilities"]["draw"] p_away = result["probabilities"]["away_win"] col1, col2, col3 = st.columns(3) with col1: st.metric("فوز المضيف", f"{p_home*100:.1f}%") with col2: st.metric("تعادل", f"{p_draw*100:.1f}%") with col3: st.metric("فوز الضيف", f"{p_away*100:.1f}%") with st.expander("مدخلات النموذج"): st.json(result["model_inputs"]) if topk and "top_scorelines" in result: st.subheader(f"أعلى {topk} نتائج محتملة") rows = [ {"النتيجة": f"{s['home_goals']} - {s['away_goals']}", "الاحتمال": f"{s['prob']*100:.2f}%"} for s in result["top_scorelines"] ] st.table(rows) except Exception as e: st.error(f"فشل التنبؤ: {e}")
-from common import config from common.utils import enhanced_team_search from common.modeling import poisson_matrix_dc, matrix_to_outcomes # حاول استيراد top_scorelines وإن فشل وفّر بديل محلي try: from common.modeling import top_scorelines except Exception: def top_scorelines(matrix, top_k=5): flat = [] for i, row in enumerate(matrix): for j, p in enumerate(row): flat.append((i, j, p)) flat.sort(key=lambda x: x[2], reverse=True) return flat[:top_k]
+# common/modeling.py (النسخة الكاملة والمصححة)
+
+import math
+from datetime import datetime
+from typing import Dict, List, Tuple, Any
+
+# يتطلب تثبيت: pip install scipy
+from scipy.optimize import minimize
+
+# استيراد الوحدات المشتركة بالطريقة الصحيحة
+from common import config
+from common.utils import parse_date_safe, parse_score, poisson_pmf
+
+
+def ewma_weight(delta_days: float, half_life_days: float) -> float:
+    """
+    يحسب الوزن باستخدام المتوسط المتحرك الأسي الموزون (EWMA).
+    """
+    if delta_days <= 0:
+        return 1.0
+    return 0.5 ** (delta_days / max(half_life_days, 1.0))
+
+def calculate_league_averages(matches: List[Dict]) -> Dict[str, float]:
+    """
+    يحسب متوسط الأهداف المسجلة للفريق المضيف والضيف في الدوري.
+    """
+    hg_sum = ag_sum = n = 0
+    for m in matches:
+        hg, ag = parse_score(m)
+        if hg is None: continue
+        hg_sum += hg
+        ag_sum += ag
+        n += 1
+    if n == 0:
+        return {"avg_home_goals": 1.4, "avg_away_goals": 1.1, "home_adv": 0.3}
+    avg_home = hg_sum / n
+    avg_away = ag_sum / n
+    home_adv = max(0.0, min(0.8, avg_home - avg_away))
+    return {"avg_home_goals": avg_home, "avg_away_goals": avg_away, "home_adv": home_adv}
+
+def build_team_factors(
+    matches: List[Dict], league_avgs: Dict, cutoff: datetime
+) -> Tuple[Dict[str, float], Dict[str, float]]:
+    """
+    يبني عوامل قوة الهجوم والدفاع لكل فريق.
+    """
+    avg_home = league_avgs["avg_home_goals"]
+    avg_away = league_avgs["avg_away_goals"]
+    hl = float(config.HALF_LIFE_DAYS)
+    prior_games = float(config.PRIOR_GAMES)
+    scored_w, expected_w, conceded_w, expectedc_w = {}, {}, {}, {}
+
+    for m in matches:
+        dt = parse_date_safe(m.get("utcDate"))
+        if not dt or dt > cutoff: continue
+        hg, ag = parse_score(m)
+        h_id, a_id = m.get("homeTeam", {}).get("id"), m.get("awayTeam", {}).get("id")
+        if hg is None or not h_id or not a_id: continue
+
+        w = ewma_weight((cutoff - dt).days, hl)
+        scored_w[h_id] = scored_w.get(h_id, 0.0) + w * hg
+        expected_w[h_id] = expected_w.get(h_id, 0.0) + w * avg_home
+        conceded_w[h_id] = conceded_w.get(h_id, 0.0) + w * ag
+        expectedc_w[h_id] = expectedc_w.get(h_id, 0.0) + w * avg_away
+        scored_w[a_id] = scored_w.get(a_id, 0.0) + w * ag
+        expected_w[a_id] = expected_w.get(a_id, 0.0) + w * avg_away
+        conceded_w[a_id] = conceded_w.get(a_id, 0.0) + w * hg
+        expectedc_w[a_id] = expectedc_w.get(a_id, 0.0) + w * avg_home
+
+    A: Dict[str, float] = {}
+    D: Dict[str, float] = {}
+    mean_rate = (avg_home + avg_away) / 2.0
+    all_team_ids = set(list(scored_w.keys()) + list(conceded_w.keys()))
+
+    for tid in all_team_ids:
+        s = scored_w.get(tid, 0.0) + prior_games * mean_rate
+        e = expected_w.get(tid, 0.0) + prior_games * mean_rate
+        a_factor = (s / e) if e > 0 else 1.0
+        sc = conceded_w.get(tid, 0.0) + prior_games * mean_rate
+        ec = expectedc_w.get(tid, 0.0) + prior_games * mean_rate
+        d_factor = (sc / ec) if ec > 0 else 1.0
+        A[str(tid)] = max(0.3, min(3.0, a_factor))
+        D[str(tid)] = max(0.3, min(3.0, d_factor))
+    return A, D
+
+def build_elo_ratings(matches: List[Dict]) -> Dict[str, float]:
+    """
+    يحسب تصنيف Elo الديناميكي للفرق.
+    """
+    elo: Dict[int, float] = {}
+    matches_sorted = sorted(
+        [m for m in matches if parse_date_safe(m.get("utcDate"))],
+        key=lambda m: parse_date_safe(m["utcDate"])
+    )
+    for m in matches_sorted:
+        h, a = m.get("homeTeam", {}).get("id"), m.get("awayTeam", {}).get("id")
+        hg, ag = parse_score(m)
+        if not h or not a or hg is None: continue
+        eh, ea = elo.get(h, 1500.0), elo.get(a, 1500.0)
+        exp_home = 1.0 / (1.0 + 10 ** (-(eh + float(config.ELO_HFA) - ea) / 400.0))
+        res_home = 1.0 if hg > ag else 0.5 if hg == ag else 0.0
+        delta = float(config.ELO_K) * (res_home - exp_home)
+        elo[h], elo[a] = eh + delta, ea - delta
+    return {str(tid): rating for tid, rating in elo.items()}
+
+def fit_dc_rho_mle(matches: List[Dict], A: Dict, D: Dict, league_avgs: Dict) -> float:
+    """
+    يجد معامل الارتباط (rho) باستخدام خوارزمية تحسين من SciPy.
+    """
+    if len(matches) < 20 or not A or not D: return 0.0
+    rho_max = float(config.DC_RHO_MAX)
+    avg_home, avg_away = league_avgs["avg_home_goals"], league_avgs["avg_away_goals"]
+    memo = {}
+    for m in matches:
+        h, a = m.get("homeTeam", {}).get("id"), m.get("awayTeam", {}).get("id")
+        hg, ag = parse_score(m)
+        if not (h and a and hg is not None): continue
+        lh = max(0.1, avg_home * A.get(str(h), 1.0) * D.get(str(a), 1.0))
+        la = max(0.1, avg_away * A.get(str(a), 1.0) * D.get(str(h), 1.0))
+        memo[m['id']] = {'lh': lh, 'la': la, 'hg': hg, 'ag': ag}
+
+    def log_likelihood(rho: float) -> float:
+        ll = 0.0
+        for data in memo.values():
+            lh, la, hg, ag = data['lh'], data['la'], data['hg'], data['ag']
+            tau = 1.0
+            if hg == 0 and ag == 0:   tau = 1.0 - rho * lh * la
+            elif hg == 0 and ag == 1: tau = 1.0 + rho * lh
+            elif hg == 1 and ag == 0: tau = 1.0 + rho * la
+            elif hg == 1 and ag == 1: tau = 1.0 - rho
+            if tau <= 1e-6: return -1e9
+            ll += (hg * math.log(lh) - lh) + (ag * math.log(la) - la) + math.log(tau)
+        return ll
+
+    result = minimize(lambda r: -log_likelihood(r[0]), x0=[0.0], bounds=[(-rho_max, rho_max)])
+    return float(result.x[0]) if result.success else 0.0
+
+def poisson_matrix_dc(lh: float, la: float, rho: float, max_goals: int = 8) -> List[List[float]]:
+    pX = [poisson_pmf(i, lh) for i in range(max_goals + 1)]
+    pY = [poisson_pmf(j, la) for j in range(max_goals + 1)]
+    M = [[pX[i] * pY[j] for j in range(max_goals + 1)] for i in range(max_goals + 1)]
+    if max_goals >= 1:
+        M[0][0] *= max(1e-6, 1.0 - rho * lh * la)
+        M[0][1] *= max(1e-6, 1.0 + rho * lh)
+        M[1][0] *= max(1e-6, 1.0 + rho * la)
+        M[1][1] *= max(1e-6, 1.0 - rho)
+    s = sum(sum(row) for row in M)
+    if s > 0:
+        for i in range(max_goals + 1):
+            for j in range(max_goals + 1): M[i][j] /= s
+    return M
+
+def matrix_to_outcomes(M: List[List[float]]) -> Tuple[float, float, float]:
+    p_home = sum(M[i][j] for i in range(len(M)) for j in range(len(M[0])) if i > j)
+    p_draw = sum(M[i][i] for i in range(min(len(M), len(M[0]))))
+    p_away = 1.0 - p_home - p_draw
+    return p_home, p_draw, p_away
+
+# --- ✅ تم إضافة الدالة المفقودة هنا ---
+def top_scorelines(matrix: List[List[float]], top_k: int = 5) -> List[Tuple[int, int, float]]:
+    """
+    يستخرج أعلى K نتائج متوقعة من مصفوفة الاحتمالات.
+    """
+    flat_list = []
+    for i in range(len(matrix)):
+        for j in range(len(matrix[0])):
+            flat_list.append((i, j, matrix[i][j]))
+    flat_list.sort(key=lambda x: x[2], reverse=True)
+    return flat_list[:top_k]
+# ------------------------------------
