@@ -1,4 +1,4 @@
-# app.py (النسخة المصححة)
+# app.py (The Corrected Version)
 
 import sys
 import os
@@ -8,17 +8,17 @@ from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Tuple, Optional
 
-# --- ✅ The Fix ---
-# Add the project root directory to the Python path.
-# This MUST be at the top, before importing from 'common'.
+# --- ✅ THE FIX: ADD THIS BLOCK AT THE VERY TOP ---
+# This adds your project's root directory to Python's path,
+# allowing it to find the 'common' folder and its modules.
 project_root = os.path.dirname(os.path.abspath(__file__))
 if project_root not in sys.path:
     sys.path.insert(0, project_root)
-# --- End of Fix ---
+# --- END OF FIX ---
 
 import streamlit as st
 
-# Now the rest of the imports will work correctly
+# Now the imports from 'common' will work correctly
 from common import config
 from common.utils import enhanced_team_search
 from common.modeling import poisson_matrix_dc, matrix_to_outcomes, top_scorelines
@@ -26,7 +26,7 @@ from common.modeling import poisson_matrix_dc, matrix_to_outcomes, top_scoreline
 # Page setup
 st.set_page_config(page_title="⚽ Football Predictor", page_icon="⚽", layout="wide")
 
-# --- The rest of your code remains the same ---
+# The rest of the code remains the same...
 
 # Simple loading cache
 @st.cache_data
@@ -54,7 +54,6 @@ def current_season_year(now: datetime) -> int:
     return now.year if now.month >= config.CURRENT_SEASON_START_MONTH else now.year - 1
 
 def _primary_name(names: List[str]) -> str:
-    # Select a "good" display name from the available list for the team
     names = [n for n in (names or []) if n]
     if not names:
         return "Unknown"
@@ -73,7 +72,6 @@ def teams_for_comp(teams_map: Dict, comp_code: str) -> List[Tuple[str, int]]:
     return out
 
 def run_pipeline_cli(years: int) -> Tuple[bool, str]:
-    # Since 01_pipeline.py cannot be imported, we run it as a process
     cmd = [sys.executable, "01_pipeline.py", "--years", str(years)]
     try:
         result = subprocess.run(cmd, capture_output=True, text=True, check=False)
@@ -105,13 +103,11 @@ def compute_prediction(
     if not teams_map:
         raise RuntimeError("Teams map not found. Please run the data pipeline first (01_pipeline.py).")
 
-    # Team search
     home_id = enhanced_team_search(team1_name, teams_map, comp_code)
     away_id = enhanced_team_search(team2_name, teams_map, comp_code)
     if not home_id or not away_id:
         raise ValueError(f"Could not find one or both teams: '{team1_name}', '{team2_name}'")
 
-    # Determine season
     season_year = current_season_year(datetime.now())
     season_key = f"{comp_code}_{season_year}"
     last_season_key = f"{comp_code}_{season_year - 1}"
@@ -137,11 +133,9 @@ def compute_prediction(
     avg_away = float(avgs.get("avg_away_goals", 1.1))
     rho = float(models["rho"].get(season_key, 0.0))
 
-    # Calculate lambda
     lam_home = home_attack * away_defense * avg_home
     lam_away = away_attack * home_defense * avg_away
 
-    # Optional ELO adjustment
     if use_elo:
         edge = (elo_home - elo_away) + config.ELO_HFA
         factor = 10 ** (edge / config.ELO_LAMBDA_SCALE)
@@ -184,7 +178,6 @@ def compute_prediction(
 st.title("⚽ Football Predictor — Streamlit UI")
 st.caption("Dixon–Coles + Team Factors + ELO (Arabic-enabled team search)")
 
-# Sidebar: Data and Model Management
 with st.sidebar:
     st.header("إدارة البيانات والنماذج")
     st.markdown("- تأكد من وضع مفتاح API في ملف .env")
@@ -207,7 +200,7 @@ with st.sidebar:
             ok, logs = run_trainer_cli()
         st.cache_data.clear()
         if ok:
-            st.success("تم تدريب النماzج بنجاح")
+            st.success("تم تدريب النماذج بنجاح")
         else:
             st.error("فشل تدريب النماذج")
         with st.expander("عرض السجلات"):
@@ -220,13 +213,10 @@ with st.sidebar:
         st.cache_data.clear()
         st.success("تم مسح الكاش")
 
-# Main Section: Prediction
 st.subheader("التنبؤ بالمباراة")
 
-# League selection
 comp_code = st.selectbox("اختر المسابقة", options=config.TARGET_COMPETITIONS, index=0)
 
-# Input mode: list or manual typing
 mode = st.radio("طريقة إدخال الفرق", options=["اختيار من القائمة", "كتابة الأسماء"], horizontal=True)
 
 team1_name = ""
@@ -261,7 +251,6 @@ else:
     with c2:
         team2_name = st.text_input("اسم الفريق الضيف", value="Arsenal", help="يمكن إدخال اسم عربي مثل 'برشلونة'")
 
-# Prediction button
 if st.button("احسب التنبؤ الآن"):
     try:
         if not team1_name or not team2_name:
@@ -269,7 +258,6 @@ if st.button("احسب التنبؤ الآن"):
             st.stop()
         result, matrix = compute_prediction(team1_name, team2_name, comp_code, use_elo=use_elo, topk=topk)
 
-        # Display results
         st.markdown(f"### {result['match']} — {result['competition']}  |  الموسم المستخدم: {result['meta']['model_season_used']}")
         p_home = result["probabilities"]["home_win"]
         p_draw = result["probabilities"]["draw"]
