@@ -2,9 +2,9 @@
   "57": {
     "id": 57,
     "names": [
-      "Arsenal FC",
       "Arsenal",
-      "ARS"
+      "ARS",
+      "Arsenal FC"
     ],
     "competitions": [
       "CL",
@@ -14,9 +14,9 @@
   "58": {
     "id": 58,
     "names": [
-      "Aston Villa FC",
       "Aston Villa",
-      "AVL"
+      "AVL",
+      "Aston Villa FC"
     ],
     "competitions": [
       "PL"
@@ -25,8 +25,8 @@
   "61": {
     "id": 61,
     "names": [
-      "Chelsea FC",
       "Chelsea",
+      "Chelsea FC",
       "CHE"
     ],
     "competitions": [
@@ -37,9 +37,9 @@
   "62": {
     "id": 62,
     "names": [
+      "Everton",
       "EVE",
-      "Everton FC",
-      "Everton"
+      "Everton FC"
     ],
     "competitions": [
       "PL"
@@ -48,8 +48,8 @@
   "63": {
     "id": 63,
     "names": [
-      "Fulham",
       "Fulham FC",
+      "Fulham",
       "FUL"
     ],
     "competitions": [
@@ -59,9 +59,9 @@
   "64": {
     "id": 64,
     "names": [
+      "Liverpool FC",
       "LIV",
-      "Liverpool",
-      "Liverpool FC"
+      "Liverpool"
     ],
     "competitions": [
       "CL",
@@ -83,9 +83,9 @@
   "66": {
     "id": 66,
     "names": [
-      "MUN",
       "Man United",
-      "Manchester United FC"
+      "Manchester United FC",
+      "MUN"
     ],
     "competitions": [
       "PL"
@@ -94,9 +94,9 @@
   "67": {
     "id": 67,
     "names": [
+      "Newcastle",
       "Newcastle United FC",
-      "NEW",
-      "Newcastle"
+      "NEW"
     ],
     "competitions": [
       "CL",
@@ -106,9 +106,9 @@
   "71": {
     "id": 71,
     "names": [
-      "Sunderland",
       "SUN",
-      "Sunderland AFC"
+      "Sunderland AFC",
+      "Sunderland"
     ],
     "competitions": [
       "PL"
@@ -117,9 +117,9 @@
   "73": {
     "id": 73,
     "names": [
+      "Tottenham",
       "TOT",
-      "Tottenham Hotspur FC",
-      "Tottenham"
+      "Tottenham Hotspur FC"
     ],
     "competitions": [
       "CL",
@@ -129,9 +129,9 @@
   "76": {
     "id": 76,
     "names": [
+      "WOL",
       "Wolverhampton",
-      "Wolverhampton Wanderers FC",
-      "WOL"
+      "Wolverhampton Wanderers FC"
     ],
     "competitions": [
       "PL"
@@ -140,8 +140,8 @@
   "328": {
     "id": 328,
     "names": [
-      "Burnley",
       "Burnley FC",
+      "Burnley",
       "BUR"
     ],
     "competitions": [
@@ -162,9 +162,9 @@
   "351": {
     "id": 351,
     "names": [
+      "Nottingham Forest FC",
       "Nottingham",
-      "NOT",
-      "Nottingham Forest FC"
+      "NOT"
     ],
     "competitions": [
       "PL"
@@ -173,8 +173,8 @@
   "354": {
     "id": 354,
     "names": [
-      "Crystal Palace FC",
       "Crystal Palace",
+      "Crystal Palace FC",
       "CRY"
     ],
     "competitions": [
@@ -185,8 +185,8 @@
     "id": 397,
     "names": [
       "Brighton & Hove Albion FC",
-      "Brighton Hove",
-      "BHA"
+      "BHA",
+      "Brighton Hove"
     ],
     "competitions": [
       "PL"
@@ -195,8 +195,8 @@
   "402": {
     "id": 402,
     "names": [
-      "Brentford FC",
       "BRE",
+      "Brentford FC",
       "Brentford"
     ],
     "competitions": [
@@ -206,9 +206,9 @@
   "563": {
     "id": 563,
     "names": [
-      "West Ham",
       "WHU",
-      "West Ham United FC"
+      "West Ham United FC",
+      "West Ham"
     ],
     "competitions": [
       "PL"
@@ -217,9 +217,9 @@
   "1044": {
     "id": 1044,
     "names": [
-      "AFC Bournemouth",
       "Bournemouth",
-      "BOU"
+      "BOU",
+      "AFC Bournemouth"
     ],
     "competitions": [
       "PL"
@@ -229,32 +229,32 @@
     "id": 77,
     "names": [
       "ATH",
-      "Athletic Club",
-      "Athletic"
+      "Athletic",
+      "Athletic Club"
     ],
     "competitions": [
-      "PD",
-      "CL"
+      "CL",
+      "PD"
     ]
   },
   "78": {
     "id": 78,
     "names": [
-      "Atleti",
+      "Club Atlético de Madrid",
       "ATL",
-      "Club Atlético de Madrid"
+      "Atleti"
     ],
     "competitions": [
-      "PD",
-      "CL"
+      "CL",
+      "PD"
     ]
   },
   "79": {
     "id": 79,
     "names": [
       "OSA",
-      "Osasuna",
-      "CA Osasuna"
+      "CA Osasuna",
+      "Osasuna"
     ],
     "competitions": [
       "PD"
@@ -263,9 +263,9 @@
   "80": {
     "id": 80,
     "names": [
-      "RCD Espanyol de Barcelona",
       "Espanyol",
-      "ESP"
+      "ESP",
+      "RCD Espanyol de Barcelona"
     ],
     "competitions": [
       "PD"
@@ -275,20 +275,20 @@
     "id": 81,
     "names": [
       "FCB",
-      "FC Barcelona",
-      "Barça"
+      "Barça",
+      "FC Barcelona"
     ],
     "competitions": [
-      "PD",
-      "CL"
+      "CL",
+      "PD"
     ]
   },
   "82": {
     "id": 82,
     "names": [
+      "Getafe",
       "GET",
-      "Getafe CF",
-      "Getafe"
+      "Getafe CF"
     ],
     "competitions": [
       "PD"
@@ -297,21 +297,21 @@
   "86": {
     "id": 86,
     "names": [
-      "RMA",
       "Real Madrid CF",
-      "Real Madrid"
+      "Real Madrid",
+      "RMA"
     ],
     "competitions": [
-      "PD",
-      "CL"
+      "CL",
+      "PD"
     ]
   },
   "87": {
     "id": 87,
     "names": [
-      "Rayo Vallecano",
+      "Rayo Vallecano de Madrid",
       "RAY",
-      "Rayo Vallecano de Madrid"
+      "Rayo Vallecano"
     ],
     "competitions": [
       "PD"
@@ -320,9 +320,9 @@
   "88": {
     "id": 88,
     "names": [
-      "Levante UD",
+      "LEV",
       "Levante",
-      "LEV"
+      "Levante UD"
     ],
     "competitions": [
       "PD"
@@ -331,8 +331,8 @@
   "89": {
     "id": 89,
     "names": [
-      "Mallorca",
       "MAL",
+      "Mallorca",
       "RCD Mallorca"
     ],
     "competitions": [
@@ -342,9 +342,9 @@
   "90": {
     "id": 90,
     "names": [
+      "Real Betis",
       "BET",
-      "Real Betis Balompié",
-      "Real Betis"
+      "Real Betis Balompié"
     ],
     "competitions": [
       "PD"
@@ -353,8 +353,8 @@
   "92": {
     "id": 92,
     "names": [
-      "RSO",
       "Real Sociedad de Fútbol",
+      "RSO",
       "Real Sociedad"
     ],
     "competitions": [
@@ -369,16 +369,16 @@
       "VIL"
     ],
     "competitions": [
-      "PD",
-      "CL"
+      "CL",
+      "PD"
     ]
   },
   "95": {
     "id": 95,
     "names": [
-      "Valencia",
+      "Valencia CF",
       "VAL",
-      "Valencia CF"
+      "Valencia"
     ],
     "competitions": [
       "PD"
@@ -387,9 +387,9 @@
   "263": {
     "id": 263,
     "names": [
-      "ALA",
+      "Alavés",
       "Deportivo Alavés",
-      "Alavés"
+      "ALA"
     ],
     "competitions": [
       "PD"
@@ -398,8 +398,8 @@
   "285": {
     "id": 285,
     "names": [
-      "Elche",
       "Elche CF",
+      "Elche",
       "ELC"
     ],
     "competitions": [
@@ -409,8 +409,8 @@
   "298": {
     "id": 298,
     "names": [
-      "Girona FC",
       "Girona",
+      "Girona FC",
       "GIR"
     ],
     "competitions": [
@@ -420,9 +420,9 @@
   "558": {
     "id": 558,
     "names": [
+      "RC Celta de Vigo",
       "Celta",
-      "CEL",
-      "RC Celta de Vigo"
+      "CEL"
     ],
     "competitions": [
       "PD"
@@ -431,8 +431,8 @@
   "559": {
     "id": 559,
     "names": [
-      "SEV",
-      "Sevilla FC"
+      "Sevilla FC",
+      "SEV"
     ],
     "competitions": [
       "PD"
@@ -441,8 +441,8 @@
   "1048": {
     "id": 1048,
     "names": [
-      "OVI",
-      "Real Oviedo"
+      "Real Oviedo",
+      "OVI"
     ],
     "competitions": [
       "PD"
@@ -451,9 +451,9 @@
   "98": {
     "id": 98,
     "names": [
+      "Milan",
       "MIL",
-      "AC Milan",
-      "Milan"
+      "AC Milan"
     ],
     "competitions": [
       "SA"
@@ -473,9 +473,9 @@
   "100": {
     "id": 100,
     "names": [
-      "AS Roma",
       "ROM",
-      "Roma"
+      "Roma",
+      "AS Roma"
     ],
     "competitions": [
       "SA"
@@ -496,9 +496,9 @@
   "103": {
     "id": 103,
     "names": [
-      "Bologna FC 1909",
       "Bologna",
-      "BOL"
+      "BOL",
+      "Bologna FC 1909"
     ],
     "competitions": [
       "SA"
@@ -508,8 +508,8 @@
     "id": 104,
     "names": [
       "Cagliari Calcio",
-      "CAG",
-      "Cagliari"
+      "Cagliari",
+      "CAG"
     ],
     "competitions": [
       "SA"
@@ -518,9 +518,9 @@
   "107": {
     "id": 107,
     "names": [
-      "Genoa CFC",
+      "Genoa",
       "GEN",
-      "Genoa"
+      "Genoa CFC"
     ],
     "competitions": [
       "SA"
@@ -529,9 +529,9 @@
   "108": {
     "id": 108,
     "names": [
-      "FC Internazionale Milano",
       "INT",
-      "Inter"
+      "Inter",
+      "FC Internazionale Milano"
     ],
     "competitions": [
       "CL",
@@ -541,9 +541,9 @@
   "109": {
     "id": 109,
     "names": [
+      "Juventus FC",
       "JUV",
-      "Juventus",
-      "Juventus FC"
+      "Juventus"
     ],
     "competitions": [
       "CL",
@@ -553,9 +553,9 @@
   "110": {
     "id": 110,
     "names": [
+      "Lazio",
       "LAZ",
-      "SS Lazio",
-      "Lazio"
+      "SS Lazio"
     ],
     "competitions": [
       "SA"
@@ -564,9 +564,9 @@
   "112": {
     "id": 112,
     "names": [
-      "PAR",
       "Parma",
-      "Parma Calcio 1913"
+      "Parma Calcio 1913",
+      "PAR"
     ],
     "competitions": [
       "SA"
@@ -576,8 +576,8 @@
     "id": 113,
     "names": [
       "NAP",
-      "Napoli",
-      "SSC Napoli"
+      "SSC Napoli",
+      "Napoli"
     ],
     "competitions": [
       "CL",
@@ -587,9 +587,9 @@
   "115": {
     "id": 115,
     "names": [
+      "Udinese Calcio",
       "Udinese",
-      "UDI",
-      "Udinese Calcio"
+      "UDI"
     ],
     "competitions": [
       "SA"
@@ -599,8 +599,8 @@
     "id": 450,
     "names": [
       "Hellas Verona FC",
-      "HVE",
-      "Verona"
+      "Verona",
+      "HVE"
     ],
     "competitions": [
       "SA"
@@ -609,8 +609,8 @@
   "457": {
     "id": 457,
     "names": [
-      "US Cremonese",
       "Cremonese",
+      "US Cremonese",
       "CRE"
     ],
     "competitions": [
@@ -632,8 +632,8 @@
     "id": 487,
     "names": [
       "PIS",
-      "AC Pisa",
-      "AC Pisa 1909"
+      "AC Pisa 1909",
+      "AC Pisa"
     ],
     "competitions": [
       "SA"
@@ -643,8 +643,8 @@
     "id": 586,
     "names": [
       "TOR",
-      "Torino",
-      "Torino FC"
+      "Torino FC",
+      "Torino"
     ],
     "competitions": [
       "SA"
@@ -653,8 +653,8 @@
   "5890": {
     "id": 5890,
     "names": [
-      "Lecce",
       "USL",
+      "Lecce",
       "US Lecce"
     ],
     "competitions": [
@@ -664,8 +664,8 @@
   "7397": {
     "id": 7397,
     "names": [
-      "COM",
-      "Como 1907"
+      "Como 1907",
+      "COM"
     ],
     "competitions": [
       "SA"
@@ -695,37 +695,37 @@
   "3": {
     "id": 3,
     "names": [
-      "Bayer 04 Leverkusen",
       "Leverkusen",
-      "B04"
+      "B04",
+      "Bayer 04 Leverkusen"
     ],
     "competitions": [
-      "CL",
-      "BL1"
+      "BL1",
+      "CL"
     ]
   },
   "4": {
     "id": 4,
     "names": [
-      "Borussia Dortmund",
+      "BVB",
       "Dortmund",
-      "BVB"
+      "Borussia Dortmund"
     ],
     "competitions": [
-      "CL",
-      "BL1"
+      "BL1",
+      "CL"
     ]
   },
   "5": {
     "id": 5,
     "names": [
+      "FC Bayern München",
       "FCB",
-      "Bayern",
-      "FC Bayern München"
+      "Bayern"
     ],
     "competitions": [
-      "CL",
-      "BL1"
+      "BL1",
+      "CL"
     ]
   },
   "7": {
@@ -741,9 +741,9 @@
   "10": {
     "id": 10,
     "names": [
-      "VfB Stuttgart",
+      "VFB",
       "Stuttgart",
-      "VFB"
+      "VfB Stuttgart"
     ],
     "competitions": [
       "BL1"
@@ -752,9 +752,9 @@
   "11": {
     "id": 11,
     "names": [
-      "VfL Wolfsburg",
+      "Wolfsburg",
       "WOB",
-      "Wolfsburg"
+      "VfL Wolfsburg"
     ],
     "competitions": [
       "BL1"
@@ -764,8 +764,8 @@
     "id": 12,
     "names": [
       "Bremen",
-      "SVW",
-      "SV Werder Bremen"
+      "SV Werder Bremen",
+      "SVW"
     ],
     "competitions": [
       "BL1"
@@ -774,9 +774,9 @@
   "15": {
     "id": 15,
     "names": [
-      "Mainz",
       "M05",
-      "1. FSV Mainz 05"
+      "1. FSV Mainz 05",
+      "Mainz"
     ],
     "competitions": [
       "BL1"
@@ -785,9 +785,9 @@
   "16": {
     "id": 16,
     "names": [
+      "FC Augsburg",
       "FCA",
-      "Augsburg",
-      "FC Augsburg"
+      "Augsburg"
     ],
     "competitions": [
       "BL1"
@@ -797,8 +797,8 @@
     "id": 17,
     "names": [
       "Freiburg",
-      "SC Freiburg",
-      "SCF"
+      "SCF",
+      "SC Freiburg"
     ],
     "competitions": [
       "BL1"
@@ -818,21 +818,21 @@
   "19": {
     "id": 19,
     "names": [
+      "Eintracht Frankfurt",
       "Frankfurt",
-      "SGE",
-      "Eintracht Frankfurt"
+      "SGE"
     ],
     "competitions": [
-      "CL",
-      "BL1"
+      "BL1",
+      "CL"
     ]
   },
   "20": {
     "id": 20,
     "names": [
-      "St. Pauli",
+      "STP",
       "FC St. Pauli 1910",
-      "STP"
+      "St. Pauli"
     ],
     "competitions": [
       "BL1"
@@ -841,9 +841,9 @@
   "28": {
     "id": 28,
     "names": [
+      "1. FC Union Berlin",
       "Union Berlin",
-      "UNB",
-      "1. FC Union Berlin"
+      "UNB"
     ],
     "competitions": [
       "BL1"
@@ -853,8 +853,8 @@
     "id": 44,
     "names": [
       "1. FC Heidenheim 1846",
-      "Heidenheim",
-      "HEI"
+      "HEI",
+      "Heidenheim"
     ],
     "competitions": [
       "BL1"
@@ -885,8 +885,8 @@
     "id": 512,
     "names": [
       "Stade Brestois 29",
-      "BRE",
-      "Brest"
+      "Brest",
+      "BRE"
     ],
     "competitions": [
       "FL1"
@@ -896,20 +896,20 @@
     "id": 516,
     "names": [
       "Olympique de Marseille",
-      "Marseille",
-      "MAR"
+      "MAR",
+      "Marseille"
     ],
     "competitions": [
-      "FL1",
-      "CL"
+      "CL",
+      "FL1"
     ]
   },
   "519": {
     "id": 519,
     "names": [
       "AJA",
-      "AJ Auxerre",
-      "Auxerre"
+      "Auxerre",
+      "AJ Auxerre"
     ],
     "competitions": [
       "FL1"
@@ -919,8 +919,8 @@
     "id": 521,
     "names": [
       "LIL",
-      "Lille",
-      "Lille OSC"
+      "Lille OSC",
+      "Lille"
     ],
     "competitions": [
       "FL1"
@@ -929,8 +929,8 @@
   "522": {
     "id": 522,
     "names": [
-      "OGC Nice",
       "Nice",
+      "OGC Nice",
       "NIC"
     ],
     "competitions": [
@@ -940,9 +940,9 @@
   "523": {
     "id": 523,
     "names": [
-      "LYO",
+      "Olympique Lyonnais",
       "Olympique Lyon",
-      "Olympique Lyonnais"
+      "LYO"
     ],
     "competitions": [
       "FL1"
@@ -951,20 +951,20 @@
   "524": {
     "id": 524,
     "names": [
-      "PSG",
-      "Paris Saint-Germain FC"
+      "Paris Saint-Germain FC",
+      "PSG"
     ],
     "competitions": [
-      "FL1",
-      "CL"
+      "CL",
+      "FL1"
     ]
   },
   "525": {
     "id": 525,
     "names": [
-      "FCL",
       "FC Lorient",
-      "Lorient"
+      "Lorient",
+      "FCL"
     ],
     "competitions": [
       "FL1"
@@ -974,8 +974,8 @@
     "id": 529,
     "names": [
       "Stade Rennais FC 1901",
-      "Stade Rennais",
-      "REN"
+      "REN",
+      "Stade Rennais"
     ],
     "competitions": [
       "FL1"
@@ -994,9 +994,9 @@
   "533": {
     "id": 533,
     "names": [
-      "Le Havre",
+      "Le Havre AC",
       "HAC",
-      "Le Havre AC"
+      "Le Havre"
     ],
     "competitions": [
       "FL1"
@@ -1005,9 +1005,9 @@
   "543": {
     "id": 543,
     "names": [
-      "FC Nantes",
       "Nantes",
-      "NAN"
+      "NAN",
+      "FC Nantes"
     ],
     "competitions": [
       "FL1"
@@ -1037,21 +1037,21 @@
   "548": {
     "id": 548,
     "names": [
-      "AS Monaco FC",
       "Monaco",
+      "AS Monaco FC",
       "ASM"
     ],
     "competitions": [
-      "FL1",
-      "CL"
+      "CL",
+      "FL1"
     ]
   },
   "576": {
     "id": 576,
     "names": [
       "RC ",
-      "RC Strasbourg Alsace",
-      "Strasbourg"
+      "Strasbourg",
+      "RC Strasbourg Alsace"
     ],
     "competitions": [
       "FL1"
@@ -1070,21 +1070,21 @@
   "498": {
     "id": 498,
     "names": [
-      "SPO",
+      "Sporting Clube de Portugal",
       "Sporting CP",
-      "Sporting Clube de Portugal"
+      "SPO"
     ],
     "competitions": [
-      "PPL",
-      "CL"
+      "CL",
+      "PPL"
     ]
   },
   "610": {
     "id": 610,
     "names": [
-      "Galatasaray SK",
+      "Galatasaray",
       "GAL",
-      "Galatasaray"
+      "Galatasaray SK"
     ],
     "competitions": [
       "CL"
@@ -1094,8 +1094,8 @@
     "id": 611,
     "names": [
       "QAR",
-      "Qarabağ Ağdam FK",
-      "Qarabağ Ağdam"
+      "Qarabağ Ağdam",
+      "Qarabağ Ağdam FK"
     ],
     "competitions": [
       "CL"
@@ -1104,9 +1104,9 @@
   "654": {
     "id": 654,
     "names": [
+      "PAE Olympiakos SFP",
       "OLY",
-      "Olympiakos",
-      "PAE Olympiakos SFP"
+      "Olympiakos"
     ],
     "competitions": [
       "CL"
@@ -1118,8 +1118,8 @@
       "PSV"
     ],
     "competitions": [
-      "DED",
-      "CL"
+      "CL",
+      "DED"
     ]
   },
   "678": {
@@ -1130,16 +1130,16 @@
       "Ajax"
     ],
     "competitions": [
-      "DED",
-      "CL"
+      "CL",
+      "DED"
     ]
   },
   "851": {
     "id": 851,
     "names": [
       "Club Brugge KV",
-      "Club Brugge",
-      "CLU"
+      "CLU",
+      "Club Brugge"
     ],
     "competitions": [
       "CL"
@@ -1149,8 +1149,8 @@
     "id": 930,
     "names": [
       "SK Slavia Praha",
-      "SLP",
-      "Slavia Praha"
+      "Slavia Praha",
+      "SLP"
     ],
     "competitions": [
       "CL"
@@ -1159,8 +1159,8 @@
   "1876": {
     "id": 1876,
     "names": [
-      "København",
       "KOB",
+      "København",
       "FC København"
     ],
     "competitions": [
@@ -1170,21 +1170,21 @@
   "1903": {
     "id": 1903,
     "names": [
-      "Sport Lisboa e Benfica",
+      "SL Benfica",
       "BEN",
-      "SL Benfica"
+      "Sport Lisboa e Benfica"
     ],
     "competitions": [
-      "PPL",
-      "CL"
+      "CL",
+      "PPL"
     ]
   },
   "3929": {
     "id": 3929,
     "names": [
+      "USG",
       "Union SG",
-      "Royale Union Saint-Gilloise",
-      "USG"
+      "Royale Union Saint-Gilloise"
     ],
     "competitions": [
       "CL"
@@ -1193,9 +1193,9 @@
   "5721": {
     "id": 5721,
     "names": [
+      "FK",
       "FK Bodø/Glimt",
-      "Bodø/Glimt",
-      "FK"
+      "Bodø/Glimt"
     ],
     "competitions": [
       "CL"
@@ -1214,8 +1214,8 @@
   "11034": {
     "id": 11034,
     "names": [
-      "Paphos FC",
-      "AEP"
+      "AEP",
+      "Paphos FC"
     ],
     "competitions": [
       "CL"
@@ -1236,8 +1236,8 @@
     "id": 670,
     "names": [
       "EXC",
-      "SBV Excelsior",
-      "Excelsior"
+      "Excelsior",
+      "SBV Excelsior"
     ],
     "competitions": [
       "DED"
@@ -1246,9 +1246,9 @@
   "671": {
     "id": 671,
     "names": [
+      "Heracles Almelo",
       "Heracles",
-      "HER",
-      "Heracles Almelo"
+      "HER"
     ],
     "competitions": [
       "DED"
@@ -1257,9 +1257,9 @@
   "673": {
     "id": 673,
     "names": [
-      "HEE",
       "SC Heerenveen",
-      "Heerenveen"
+      "Heerenveen",
+      "HEE"
     ],
     "competitions": [
       "DED"
@@ -1268,8 +1268,8 @@
   "675": {
     "id": 675,
     "names": [
-      "FEY",
       "Feyenoord Rotterdam",
+      "FEY",
       "Feyenoord"
     ],
     "competitions": [
@@ -1279,9 +1279,9 @@
   "676": {
     "id": 676,
     "names": [
-      "FC Utrecht",
       "UTR",
-      "Utrecht"
+      "Utrecht",
+      "FC Utrecht"
     ],
     "competitions": [
       "DED"
@@ -1301,8 +1301,8 @@
   "681": {
     "id": 681,
     "names": [
-      "NAC",
-      "NAC Breda"
+      "NAC Breda",
+      "NAC"
     ],
     "competitions": [
       "DED"
@@ -1320,9 +1320,9 @@
   "684": {
     "id": 684,
     "names": [
-      "Zwolle",
       "PEC Zwolle",
-      "ZWO"
+      "ZWO",
+      "Zwolle"
     ],
     "competitions": [
       "DED"
@@ -1331,8 +1331,8 @@
   "718": {
     "id": 718,
     "names": [
-      "GOA",
       "Go Ahead",
+      "GOA",
       "Go Ahead Eagles"
     ],
     "competitions": [
@@ -1343,8 +1343,8 @@
     "id": 1912,
     "names": [
       "TEL",
-      "Telstar",
-      "Telstar 1963"
+      "Telstar 1963",
+      "Telstar"
     ],
     "competitions": [
       "DED"
@@ -1362,9 +1362,9 @@
   "1919": {
     "id": 1919,
     "names": [
-      "FC Volendam",
       "VOL",
-      "Volendam"
+      "Volendam",
+      "FC Volendam"
     ],
     "competitions": [
       "DED"
@@ -1373,9 +1373,9 @@
   "1920": {
     "id": 1920,
     "names": [
-      "SIT",
+      "Sittard",
       "Fortuna Sittard",
-      "Sittard"
+      "SIT"
     ],
     "competitions": [
       "DED"
@@ -1395,9 +1395,9 @@
   "496": {
     "id": 496,
     "names": [
+      "Rio Ave FC",
       "RIO",
-      "Rio Ave",
-      "Rio Ave FC"
+      "Rio Ave"
     ],
     "competitions": [
       "PPL"
@@ -1406,8 +1406,8 @@
   "503": {
     "id": 503,
     "names": [
-      "Porto",
       "FCP",
+      "Porto",
       "FC Porto"
     ],
     "competitions": [
@@ -1439,9 +1439,9 @@
   "712": {
     "id": 712,
     "names": [
-      "Arouca",
       "FCA",
-      "FC Arouca"
+      "FC Arouca",
+      "Arouca"
     ],
     "competitions": [
       "PPL"
@@ -1450,8 +1450,8 @@
   "1049": {
     "id": 1049,
     "names": [
-      "TON",
       "Tondela",
+      "TON",
       "CD Tondela"
     ],
     "competitions": [
@@ -1461,8 +1461,8 @@
   "5529": {
     "id": 5529,
     "names": [
-      "CD Nacional",
-      "CDN"
+      "CDN",
+      "CD Nacional"
     ],
     "competitions": [
       "PPL"
@@ -1472,8 +1472,8 @@
     "id": 5530,
     "names": [
       "Santa Clara",
-      "CD ",
-      "CD Santa Clara"
+      "CD Santa Clara",
+      "CD "
     ],
     "competitions": [
       "PPL"
@@ -1482,9 +1482,9 @@
   "5531": {
     "id": 5531,
     "names": [
-      "Famalicão",
       "FAM",
-      "FC Famalicão"
+      "FC Famalicão",
+      "Famalicão"
     ],
     "competitions": [
       "PPL"
@@ -1515,8 +1515,8 @@
     "id": 5613,
     "names": [
       "Sporting Clube de Braga",
-      "SCB",
-      "Braga"
+      "Braga",
+      "SCB"
     ],
     "competitions": [
       "PPL"
@@ -1525,9 +1525,9 @@
   "6618": {
     "id": 6618,
     "names": [
+      "Casa Pia",
       "Casa Pia AC",
-      "CAS",
-      "Casa Pia"
+      "CAS"
     ],
     "competitions": [
       "PPL"
@@ -1537,8 +1537,8 @@
     "id": 7822,
     "names": [
       "Alverca",
-      "ALV",
-      "FC Alverca"
+      "FC Alverca",
+      "ALV"
     ],
     "competitions": [
       "PPL"
@@ -1567,9 +1567,9 @@
   "1765": {
     "id": 1765,
     "names": [
+      "Fluminense FC",
       "FLU",
-      "Fluminense",
-      "Fluminense FC"
+      "Fluminense"
     ],
     "competitions": [
       "BSA"
@@ -1578,9 +1578,9 @@
   "1766": {
     "id": 1766,
     "names": [
+      "CA Mineiro",
       "CAM",
-      "Mineiro",
-      "CA Mineiro"
+      "Mineiro"
     ],
     "competitions": [
       "BSA"
@@ -1590,8 +1590,8 @@
     "id": 1767,
     "names": [
       "FBP",
-      "Grêmio FBPA",
-      "Grêmio"
+      "Grêmio",
+      "Grêmio FBPA"
     ],
     "competitions": [
       "BSA"
@@ -1600,9 +1600,9 @@
   "1769": {
     "id": 1769,
     "names": [
-      "SE Palmeiras",
       "PAL",
-      "Palmeiras"
+      "Palmeiras",
+      "SE Palmeiras"
     ],
     "competitions": [
       "BSA"
@@ -1611,9 +1611,9 @@
   "1770": {
     "id": 1770,
     "names": [
-      "Botafogo",
       "Botafogo FR",
-      "BOT"
+      "BOT",
+      "Botafogo"
     ],
     "competitions": [
       "BSA"
@@ -1622,9 +1622,9 @@
   "1771": {
     "id": 1771,
     "names": [
-      "CRU",
+      "Cruzeiro",
       "Cruzeiro EC",
-      "Cruzeiro"
+      "CRU"
     ],
     "competitions": [
       "BSA"
@@ -1633,8 +1633,8 @@
   "1776": {
     "id": 1776,
     "names": [
-      "PAU",
       "São Paulo",
+      "PAU",
       "São Paulo FC"
     ],
     "competitions": [
@@ -1644,9 +1644,9 @@
   "1777": {
     "id": 1777,
     "names": [
-      "EC Bahia",
       "BAH",
-      "Bahia"
+      "Bahia",
+      "EC Bahia"
     ],
     "competitions": [
       "BSA"
@@ -1655,8 +1655,8 @@
   "1778": {
     "id": 1778,
     "names": [
-      "SC Recife",
       "REC",
+      "SC Recife",
       "Recife"
     ],
     "competitions": [
@@ -1667,8 +1667,8 @@
     "id": 1779,
     "names": [
       "COR",
-      "SC Corinthians Paulista",
-      "Corinthians"
+      "Corinthians",
+      "SC Corinthians Paulista"
     ],
     "competitions": [
       "BSA"
@@ -1688,9 +1688,9 @@
   "1782": {
     "id": 1782,
     "names": [
+      "Vitória",
       "VIT",
-      "EC Vitória",
-      "Vitória"
+      "EC Vitória"
     ],
     "competitions": [
       "BSA"
@@ -1699,9 +1699,9 @@
   "1783": {
     "id": 1783,
     "names": [
-      "FLA",
+      "CR Flamengo",
       "Flamengo",
-      "CR Flamengo"
+      "FLA"
     ],
     "competitions": [
       "BSA"
@@ -1710,9 +1710,9 @@
   "1837": {
     "id": 1837,
     "names": [
-      "Ceará",
       "CSC",
-      "Ceará SC"
+      "Ceará SC",
+      "Ceará"
     ],
     "competitions": [
       "BSA"
@@ -1721,8 +1721,8 @@
   "3984": {
     "id": 3984,
     "names": [
-      "Fortaleza",
       "Fortaleza EC",
+      "Fortaleza",
       "FEC"
     ],
     "competitions": [
@@ -1732,8 +1732,8 @@
   "4245": {
     "id": 4245,
     "names": [
-      "Juventude",
       "JUV",
+      "Juventude",
       "EC Juventude"
     ],
     "competitions": [
@@ -1743,9 +1743,9 @@
   "4286": {
     "id": 4286,
     "names": [
-      "Bragantino",
       "RB Bragantino",
-      "RBB"
+      "RBB",
+      "Bragantino"
     ],
     "competitions": [
       "BSA"
@@ -1754,9 +1754,9 @@
   "4364": {
     "id": 4364,
     "names": [
-      "Mirassol FC",
       "Mirassol",
-      "MIR"
+      "MIR",
+      "Mirassol FC"
     ],
     "competitions": [
       "BSA"
@@ -1765,9 +1765,9 @@
   "6684": {
     "id": 6684,
     "names": [
-      "SCI",
+      "Internacional",
       "SC Internacional",
-      "Internacional"
+      "SCI"
     ],
     "competitions": [
       "BSA"
