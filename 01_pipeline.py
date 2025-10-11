@@ -19,7 +19,7 @@ from pathlib import Path
 from typing import Dict, Any
 
 # استيراد الوحدات المشتركة
-from common.config import config
+from common import config
 from common.api_client import APIClient
 from common.utils import log
 

@@ -8,7 +8,7 @@ from typing import Dict, List, Tuple, Optional
 
 import streamlit as st
 
-from common.config import config
+from common import config
 from common.utils import enhanced_team_search, log
 from common.modeling import poisson_matrix_dc, matrix_to_outcomes, top_scorelines
 
