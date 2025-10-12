@@ -1,4 +1,4 @@
-# app.py (النسخة النهائية مع دمج الخبير في الواجهة الرسومية)
+# app.py (النسخة النهائية المصححة مع جميع الأزرار)
 
 import sys
 import os
@@ -10,6 +10,7 @@ from typing import Dict, List, Tuple, Optional
 import pandas as pd
 import xgboost as xgb
 from sklearn.preprocessing import LabelEncoder
+import streamlit as st
 
 # --- إضافة مسار المشروع الرئيسي إلى بايثون ---
 try:
@@ -22,15 +23,9 @@ except NameError:
         sys.path.insert(0, project_root)
 # ---------------------------------------------
 
-import streamlit as st
-
-# استيراد الوحدات المشتركة
 from common import config
 from common.utils import enhanced_team_search
-from common.modeling import (
-    poisson_matrix_dc, matrix_to_outcomes, top_scorelines,
-    calculate_team_form # ضروري لنموذج تعلم الآلة
-)
+from common.modeling import poisson_matrix_dc, matrix_to_outcomes, top_scorelines, calculate_team_form
 
 # إعدادات الصفحة
 st.set_page_config(page_title="⚽ Football Predictor", page_icon="⚽", layout="wide")
@@ -46,17 +41,14 @@ def _load_json(path: Path) -> Optional[dict]:
 
 @st.cache_data
 def load_all_matches() -> List[Dict]:
-    """تحميل جميع المباريات."""
     return _load_json(config.DATA_DIR / "matches.json") or []
 
 @st.cache_data
 def load_teams_map() -> Optional[Dict]:
-    """تحميل خريطة الفرق."""
     return _load_json(config.DATA_DIR / "teams.json")
 
 @st.cache_data
 def load_statistical_models() -> Dict[str, dict]:
-    """تحميل النماذج الإحصائية."""
     return {
         "averages": _load_json(config.MODELS_DIR / "league_averages.json") or {},
         "factors": _load_json(config.MODELS_DIR / "team_factors.json") or {},
@@ -66,7 +58,6 @@ def load_statistical_models() -> Dict[str, dict]:
 
 @st.cache_data
 def load_xgboost_model() -> Optional[xgb.XGBClassifier]:
-    """تحميل نموذج تعلم الآلة XGBoost."""
     model_path = config.MODELS_DIR / "xgboost_model.json"
     if not model_path.exists():
         return None
@@ -74,9 +65,8 @@ def load_xgboost_model() -> Optional[xgb.XGBClassifier]:
     model.load_model(model_path)
     return model
 
-# --- دوال تشغيل السكريبتات من سطر الأوامر ---
+# --- دوال لتشغيل السكريبتات من سطر الأوامر ---
 def run_cli_script(cmd: List[str]) -> Tuple[bool, str]:
-    """دالة عامة لتشغيل أي سكريبت."""
     try:
         result = subprocess.run(cmd, capture_output=True, text=True, check=False, encoding='utf-8', cwd=project_root)
         ok = (result.returncode == 0)
@@ -89,8 +79,21 @@ def run_cli_script(cmd: List[str]) -> Tuple[bool, str]:
 def current_season_year(now: datetime) -> int:
     return now.year if now.month >= config.CURRENT_SEASON_START_MONTH else now.year - 1
 
+def _primary_name(names: List[str]) -> str:
+    names = [n for n in (names or []) if n]
+    if not names: return "Unknown"
+    return sorted(names, key=lambda n: (len(n), -ord(n[0])) , reverse=True)[0]
+
+
+def teams_for_comp(teams_map: Dict, comp_code: str) -> List[Tuple[str, int]]:
+    out = sorted(
+        [(_primary_name(t.get("names", [])), t.get("id"))
+         for t in teams_map.values() if comp_code in t.get("competitions", []) and t.get("id")],
+        key=lambda x: x[0].lower()
+    )
+    return out
+
 def compute_statistical_prediction(team1_id: int, team2_id: int, comp_code: str, use_elo: bool, topk: int) -> dict:
-    """الدالة الأساسية لحساب التوقع الإحصائي."""
     season_year = current_season_year(datetime.now())
     season_key = f"{comp_code}_{season_year}"
     models = load_statistical_models()
@@ -100,7 +103,6 @@ def compute_statistical_prediction(team1_id: int, team2_id: int, comp_code: str,
         if season_key not in models["elo"]:
             raise RuntimeError(f"لا توجد نماذج إحصائية حديثة لمسابقة {comp_code}.")
 
-    # استرجاع كل المعاملات اللازمة من النماذج المحملة
     elo, factors, avgs, rho = (models["elo"].get(season_key, {}), models["factors"].get(season_key, {}),
                                models["averages"].get(season_key, {}), float(models["rho"].get(season_key, 0.0)))
     
@@ -136,12 +138,10 @@ def compute_statistical_prediction(team1_id: int, team2_id: int, comp_code: str,
     return result
 
 def compute_ml_prediction(home_team_id: int, away_team_id: int, competition_code: str) -> Dict:
-    """الدالة الأساسية لحساب التوقع باستخدام نموذج تعلم الآلة (الخبير)."""
     model = load_xgboost_model()
     if not model:
         raise RuntimeError("نموذج `xgboost_model.json` غير موجود. يرجى تدريب النموذج (الخطوة 4) أولاً.")
 
-    # تحميل البيانات اللازمة لبناء الميزات
     all_matches = load_all_matches()
     stat_models = load_statistical_models()
     season_year = current_season_year(datetime.now())
@@ -152,7 +152,6 @@ def compute_ml_prediction(home_team_id: int, away_team_id: int, competition_code
         if season_key not in stat_models["elo"]:
             raise ValueError(f"لا توجد نماذج إحصائية حديثة لموسم {competition_code} لبناء الميزات.")
 
-    # بناء الميزات التسعة للمباراة الحالية
     season_factors = stat_models["factors"].get(season_key, {})
     season_elo = stat_models["elo"].get(season_key, {})
     
@@ -172,11 +171,8 @@ def compute_ml_prediction(home_team_id: int, away_team_id: int, competition_code
     }
     
     features_df = pd.DataFrame([features])
-    
-    # إجراء التنبؤ
     predicted_probabilities = model.predict_proba(features_df)
     
-    # تحويل الاحتمالات إلى الشكل المطلوب
     le = LabelEncoder().fit([-1, 0, 1])
     prob_away = predicted_probabilities[0][le.transform([-1])[0]]
     prob_draw = predicted_probabilities[0][le.transform([0])[0]]
@@ -192,70 +188,111 @@ def compute_ml_prediction(home_team_id: int, away_team_id: int, competition_code
 # ==============================================================================
 
 st.title("⚽ لوحة تحكم متكاملة لتوقع نتائج المباريات")
+st.caption("النموذج الإحصائي (Dixon-Coles + ELO) ونموذج تعلم الآلة (XGBoost)")
 
-# --- الشريط الجانبي (Sidebar) ---
 with st.sidebar:
-    # ... (كود الشريط الجانبي يبقى كما هو) ...
-
-# --- قسم اختيار الفرق ---
-st.header("اختيار المباراة")
-teams_map = load_teams_map()
-if not teams_map:
-    st.error("ملف `teams.json` غير موجود. يرجى تشغيل 'تحديث البيانات' أولاً.")
-    st.stop()
-
-comp_code = st.selectbox("اختر المسابقة", options=config.TARGET_COMPETITIONS, index=0)
-comp_teams = teams_for_comp(teams_map, comp_code)
-
-if not comp_teams:
-    st.warning(f"لم يتم العثور على فرق لمسابقة '{comp_code}'.")
-else:
-    names = [n for n, _ in comp_teams]
-    name_to_id = {n: tid for n, tid in comp_teams}
+    st.header("⚙️ إدارة المشروع")
+    st.info("يجب تشغيل العمليات بالترتيب (1 -> 2 -> 3 -> 4).")
     
-    c1, c2 = st.columns(2)
-    team1_name = c1.selectbox("الفريق المضيف", options=names, index=0)
-    team2_name = c2.selectbox("الفريق الضيف", options=names, index=1 if len(names) > 1 else 0)
+    with st.expander("المرحلة 1: البيانات والنماذج الإحصائية", expanded=True):
+        years = st.number_input("عدد المواسم لجلب البيانات", 1, 20, 3, key="years_input")
+        if st.button("1. تحديث البيانات (Pipeline)"):
+            with st.spinner("⏳ جارٍ جلب البيانات..."):
+                ok, logs = run_cli_script([sys.executable, "01_pipeline.py", "--years", str(years)])
+            st.cache_data.clear()
+            st.success("✅ اكتملت العملية.") if ok else st.error("❌ فشلت العملية.")
+            st.code(logs, language='bash')
 
-    if team1_name == team2_name:
-        st.warning("يرجى اختيار فريقين مختلفين.")
+        if st.button("2. تدريب النماذج الإحصائية (Trainer)"):
+            with st.spinner("⏳ جارٍ تدريب النماذج الإحصائية..."):
+                ok, logs = run_cli_script([sys.executable, "02_trainer.py"])
+            st.cache_data.clear()
+            st.success("✅ اكتمل التدريب.") if ok else st.error("❌ فشل التدريب.")
+            st.code(logs, language='bash')
+
+    with st.expander("المرحلة 2: نماذج تعلم الآلة (ML)"):
+        if st.button("3. إنشاء ميزات التدريب (Features)"):
+            with st.spinner("⏳ جارٍ إنشاء ملف الميزات..."):
+                ok, logs = run_cli_script([sys.executable, "04_feature_generator.py"])
+            st.success("✅ تم إنشاء الملف بنجاح.") if ok else st.error("❌ فشل إنشاء الملف.")
+            st.code(logs, language='bash')
+
+        if st.button("4. تدريب نموذج ML (المُعلّم)"):
+            with st.spinner("⏳ جارٍ تدريب نموذج XGBoost..."):
+                ok, logs = run_cli_script([sys.executable, "05_train_ml_model.py"])
+            st.cache_data.clear()
+            model_path = config.MODELS_DIR / "xgboost_model.json"
+            if ok and model_path.exists(): st.success("✅ اكتمل التدريب وتم إنشاء الملف.")
+            else: st.error("❌ فشل التدريب أو لم يتم إنشاء الملف.")
+            st.code(logs, language='bash')
+
+    with st.expander("أدوات إضافية"):
+        model_path_check = config.MODELS_DIR / "xgboost_model.json"
+        if model_path_check.exists():
+            with open(model_path_check, "rb") as fp:
+                st.download_button("📥 تحميل نموذج ML", fp, "xgboost_model.json", "application/json")
+        
+        if st.button("تشغيل توقع ML (الخبير)"):
+            with st.spinner("⏳ جارٍ تشغيل الخبير..."):
+                ok, logs = run_cli_script([sys.executable, "06_predict_ml.py"])
+            st.success("✅ تم تشغيل الخبير.") if ok else st.error("❌ فشل تشغيل الخبير.")
+            st.code(logs, language='bash')
+
+        if st.button("إجراء الاختبار التاريخي (Backtester)"):
+            with st.spinner("⏳ جارٍ إجراء الاختبار التاريخي..."):
+                ok, logs = run_cli_script([sys.executable, "03_backtester.py"])
+            st.success("✅ اكتمل الاختبار.") if ok else st.error("❌ فشل الاختبار.")
+            st.code(logs, language='bash')
+
+st.divider()
+st.header("🔮 اختيار المباراة والتنبؤ")
+teams_map = load_teams_map()
+
+if not teams_map:
+    st.error("لم يتم العثور على ملف `teams.json`. يرجى تشغيل 'تحديث البيانات' أولاً.")
+else:
+    comp_code = st.selectbox("اختر المسابقة", options=config.TARGET_COMPETITIONS, index=0)
+    comp_teams = teams_for_comp(teams_map, comp_code)
+    if not comp_teams:
+        st.warning(f"لم يتم العثور على فرق لمسابقة '{comp_code}'.")
     else:
-        team1_id = name_to_id[team1_name]
-        team2_id = name_to_id[team2_name]
-
-        st.divider()
+        names = [n for n, _ in comp_teams]
+        name_to_id = {n: tid for n, tid in comp_teams}
         
-        # --- قسم التنبؤ المزدوج ---
         c1, c2 = st.columns(2)
+        team1_name = c1.selectbox("الفريق المضيف", options=names, index=0)
+        team2_name = c2.selectbox("الفريق الضيف", options=names, index=1 if len(names) > 1 else 0)
         
-        with c1:
-            st.subheader("تنبؤ النموذج الإحصائي")
-            use_elo_stat = st.checkbox("تفعيل تعديل ELO", value=True, key="stat_elo")
-            if st.button("📊 احسب التنبؤ الإحصائي", use_container_width=True):
-                try:
-                    result = compute_statistical_prediction(team1_id, team2_id, comp_code, use_elo_stat, topk=5)
-                    p_home, p_draw, p_away = (result["probabilities"]["home_win"], 
-                                              result["probabilities"]["draw"], 
-                                              result["probabilities"]["away_win"])
-                    st.metric("فوز المضيف", f"{p_home*100:.1f}%")
-                    st.metric("تعادل", f"{p_draw*100:.1f}%")
-                    st.metric("فوز الضيف", f"{p_away*100:.1f}%")
-                    with st.expander("عرض مدخلات النموذج"): st.json(result["model_inputs"])
-                except Exception as e:
-                    st.error(f"فشل التنبؤ: {e}")
+        if team1_name == team2_name:
+            st.warning("يرجى اختيار فريقين مختلفين.")
+        else:
+            team1_id = name_to_id[team1_name]
+            team2_id = name_to_id[team2_name]
+            st.divider()
+            
+            c1, c2 = st.columns(2)
+            with c1:
+                st.subheader("النموذج الإحصائي")
+                use_elo_stat = st.checkbox("تفعيل تعديل ELO", value=True, key="stat_elo")
+                if st.button("📊 احسب التنبؤ الإحصائي", use_container_width=True):
+                    try:
+                        result = compute_statistical_prediction(team1_id, team2_id, comp_code, use_elo_stat, topk=5)
+                        p_home, p_draw, p_away = result["probabilities"].values()
+                        st.metric("فوز المضيف", f"{p_home*100:.1f}%")
+                        st.metric("تعادل", f"{p_draw*100:.1f}%")
+                        st.metric("فوز الضيف", f"{p_away*100:.1f}%")
+                    except Exception as e:
+                        st.error(f"فشل: {e}")
 
-        with c2:
-            st.subheader("تنبؤ نموذج تعلم الآلة (الخبير)")
-            if st.button("🧠 احسب تنبؤ الخبير (ML)", type="primary", use_container_width=True):
-                try:
-                    result = compute_ml_prediction(team1_id, team2_id, comp_code)
-                    p_home, p_draw, p_away = (result["probabilities"]["home_win"], 
-                                              result["probabilities"]["draw"], 
-                                              result["probabilities"]["away_win"])
-                    st.metric("فوز المضيف", f"{p_home*100:.1f}%")
-                    st.metric("تعادل", f"{p_draw*100:.1f}%")
-                    st.metric("فوز الضيف", f"{p_away*100:.1f}%")
-                    with st.expander("عرض الميزات المستخدمة"): st.json(result["features_used"])
-                except Exception as e:
-                    st.error(f"فشل التنبؤ: {e}")
-
+            with c2:
+                st.subheader("نموذج تعلم الآلة (الخبير)")
+                if st.button("🧠 احسب تنبؤ الخبير", type="primary", use_container_width=True):
+                    try:
+                        result = compute_ml_prediction(team1_id, team2_id, comp_code)
+                        p_home, p_draw, p_away = result["probabilities"].values()
+                        st.metric("فوز المضيف", f"{p_home*100:.1f}%")
+                        st.metric("تعادل", f"{p_draw*100:.1f}%")
+                        st.metric("فوز الضيف", f"{p_away*100:.1f}%")
+                        with st.expander("عرض الميزات المستخدمة"): st.json(result["features_used"])
+                    except Exception as e:
+                        st.error(f"فشل: {e}")
