@@ -10,7 +10,6 @@
 # الاستخدام:
 # python 01_pipeline.py --years 3
 # -----------------------------------------------------------------------------
-
 import json
 import argparse
 from datetime import datetime
@@ -21,20 +20,13 @@ from common import config
 from common.api_client import APIClient
 from common.utils import log
 
-
 def _get_current_season_start_year() -> int:
-    """
-    يحسب سنة بداية الموسم الكروي الحالي.
-    تعتبر أن المواسم الأوروبية تبدأ في شهر يوليو (7).
-    """
+    """ يحسب سنة بداية الموسم الكروي الحالي. تعتبر أن المواسم الأوروبية تبدأ في شهر يوليو (7). """
     now = datetime.now()
     return now.year if now.month >= 7 else now.year - 1
 
-
 def run_pipeline(years_to_fetch: int):
-    """
-    الدالة الرئيسية لتشغيل عملية سحب وتنظيم البيانات.
-
+    """ الدالة الرئيسية لتشغيل عملية سحب وتنظيم البيانات.
     Args:
         years_to_fetch (int): عدد المواسم السابقة التي سيتم جلب بياناتها.
     """
@@ -65,7 +57,6 @@ def run_pipeline(years_to_fetch: int):
         for year in target_years:
             log(f"جاري جلب مباريات {code} لموسم {year}...", "INFO")
             matches_in_year = client.get_matches_for_season(year, comp_id)
-
             if matches_in_year:
                 log(f"تم العثور على {len(matches_in_year)} مباراة لـ {code} (موسم {year}).", "INFO")
                 for match in matches_in_year:
@@ -100,7 +91,6 @@ def run_pipeline(years_to_fetch: int):
     # --- 6. جلب وحفظ بيانات الفرق ---
     log("جاري جلب بيانات الفرق لجميع المسابقات المستهدفة...", "INFO")
     teams_data = client.get_teams_for_competitions(list(target_competitions.values()))
-
     if teams_data:
         teams_path = config.DATA_DIR / "teams.json"
         try:
@@ -113,7 +103,6 @@ def run_pipeline(years_to_fetch: int):
         log("لم يتم العثور على بيانات للفرق.", "WARNING")
 
     log("--- انتهت عملية سحب البيانات بنجاح ---", "INFO")
-
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
