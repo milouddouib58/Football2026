@@ -1,38 +1,41 @@
 # app.py
 # -----------------------------------------------------------------------------
-# لوحة Streamlit مع أزرار لإدارة البيانات والنماذج وزر تنبؤ باستخدام Predictor.
+# لوحة Streamlit لإدارة خط أنابيب البيانات والنماذج، وتشغيل التنبؤ باستخدام
+# كلاس Predictor الموحّد مع كاش محسّن وتشخيصات مبسّطة.
 # -----------------------------------------------------------------------------
 
 import sys
 import os
 import json
 import subprocess
-import pandas as pd
-import xgboost as xgb
-from datetime import datetime, timezone
+from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Tuple, Optional
 
 # --- إضافة مسار المشروع الرئيسي إلى بايثون ---
 project_root = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, project_root)
-# ---------------------------------------------
 
+# ---------------------------------------------
 import streamlit as st
 from common import config
-from common.utils import enhanced_team_search, log
-from common.modeling import calculate_team_form
-from predictor import Predictor  # استخدام الكلاس الموحد
+from common.utils import log
+from predictor import Predictor
 
+# -----------------------------------------------------------------------------
 # إعدادات الصفحة
-st.set_page_config(page_title="⚽ Football Predictor", page_icon="⚽", layout="wide")
+# -----------------------------------------------------------------------------
+st.set_page_config(
+    page_title="⚽ Football Predictor",
+    page_icon="⚽",
+    layout="wide"
+)
 
-
-# --- دوال مساعدة لتحميل البيانات مع كاش ---
-
+# -----------------------------------------------------------------------------
+# كاش وقراءة الملفات
+# -----------------------------------------------------------------------------
 @st.cache_data
 def _load_json(path: Path) -> Optional[dict]:
-    """تحميل ملف JSON مع معالجة الأخطاء."""
     try:
         with open(path, "r", encoding="utf-8") as f:
             return json.load(f)
@@ -41,34 +44,34 @@ def _load_json(path: Path) -> Optional[dict]:
 
 @st.cache_data
 def load_teams_map() -> Optional[Dict]:
-    """تحميل بيانات الفرق من ملف JSON."""
     return _load_json(config.DATA_DIR / "teams.json")
 
 @st.cache_data
-def load_all_matches() -> Optional[List]:
-    """تحميل جميع المباريات من ملف JSON."""
-    return _load_json(config.DATA_DIR / "matches.json")
-
-@st.cache_resource
-def load_xgboost_model() -> Optional[xgb.XGBClassifier]:
-    """تحميل نموذج XGBoost المدرب."""
-    try:
-        model = xgb.XGBClassifier()
-        model.load_model(config.MODELS_DIR / "xgboost_model.json")
-        return model
-    except Exception:
-        return None
-
-# --- كائن Predictor مع كاش على مستوى الموارد ---
+def load_models() -> Dict[str, dict]:
+    return {
+        "averages": _load_json(config.MODELS_DIR / "league_averages.json") or {},
+        "factors": _load_json(config.MODELS_DIR / "team_factors.json") or {},
+        "elo": _load_json(config.MODELS_DIR / "elo_ratings.json") or {},
+        "rho": _load_json(config.MODELS_DIR / "rho_values.json") or {},
+    }
 
 @st.cache_resource
 def get_predictor() -> Predictor:
-    """إنشاء وتحميل كائن Predictor الإحصائي مع التخزين المؤقت."""
     return Predictor()
 
+def safe_clear_cache():
+    try:
+        st.cache_data.clear()
+    except Exception:
+        pass
+    try:
+        st.cache_resource.clear()
+    except Exception:
+        pass
 
-# --- دوال الواجهة والمساعدة ---
-
+# -----------------------------------------------------------------------------
+# أدوات مساعدة
+# -----------------------------------------------------------------------------
 def run_cli_script(cmd: List[str]) -> Tuple[bool, str]:
     """تشغيل أي سكريبت والتقاط مخرجاته."""
     try:
@@ -79,173 +82,166 @@ def run_cli_script(cmd: List[str]) -> Tuple[bool, str]:
     except Exception as e:
         return False, f"فشل في تشغيل السكريبت: {e}"
 
+def current_season_year(now: datetime) -> int:
+    return now.year if now.month >= config.CURRENT_SEASON_START_MONTH else now.year - 1
+
 def _primary_name(names: List[str]) -> str:
-    """اختيار الاسم الأساسي للفريق من قائمة الأسماء المتاحة."""
     names = [n for n in (names or []) if n]
     if not names:
         return "Unknown"
+
     def score(n: str) -> Tuple[int, int, int]:
+        # تفضيل الأسماء التي تحتوي فراغ (أقرب للاسم الكامل)، الأطول، وغير الكبيرة بالكامل
         return (int(" " in n), len(n), -int(n.isupper()))
+
     return sorted(names, key=score, reverse=True)[0]
 
 def teams_for_comp(teams_map: Dict, comp_code: str) -> List[Tuple[str, int]]:
-    """الحصول على قائمة الفرق لمسابقة معينة."""
     out = sorted(
-        [
-            (_primary_name(t.get("names", [])), t.get("id"))
-            for t in teams_map.values()
-            if comp_code in t.get("competitions", []) and t.get("id")
-        ],
-        key=lambda x: x[0].lower(),
+        [(_primary_name(t.get("names", [])), t.get("id")) for t in teams_map.values()
+         if comp_code in t.get("competitions", []) and t.get("id")],
+        key=lambda x: x[0].lower()
     )
     return out
 
-def compute_statistical_prediction(team1_name: str, team2_name: str, comp_code: str, use_elo: bool, topk: int):
-    """استدعاء Predictor الإحصائي لحساب التنبؤ."""
+def compute_prediction(team1_name: str, team2_name: str, comp_code: str, use_elo: bool, topk: int):
     pred = get_predictor()
     result = pred.predict(team1_name, team2_name, comp_code, topk=topk, use_elo=use_elo)
     return result
 
-def compute_ml_prediction(home_team_id: int, away_team_id: int, comp_code: str):
-    """حساب التنبؤ باستخدام نموذج الخبير (XGBoost)."""
-    model = load_xgboost_model()
-    team_factors = _load_json(config.MODELS_DIR / "team_factors.json")
-    elo_ratings = _load_json(config.MODELS_DIR / "elo_ratings.json")
-    all_matches = load_all_matches()
+def model_file_info() -> List[Tuple[str, Path, bool, Optional[float], Optional[int]]]:
+    files = [
+        ("matches.json", config.DATA_DIR / "matches.json"),
+        ("teams.json", config.DATA_DIR / "teams.json"),
+        ("league_averages.json", config.MODELS_DIR / "league_averages.json"),
+        ("team_factors.json", config.MODELS_DIR / "team_factors.json"),
+        ("elo_ratings.json", config.MODELS_DIR / "elo_ratings.json"),
+        ("rho_values.json", config.MODELS_DIR / "rho_values.json"),
+        ("xgboost_model.json", config.MODELS_DIR / "xgboost_model.json"),
+    ]
+    out = []
+    for name, p in files:
+        try:
+            exists = p.exists()
+            mtime = p.stat().st_mtime if exists else None
+            size = p.stat().st_size if exists else None
+        except Exception:
+            exists, mtime, size = False, None, None
+        out.append((name, p, exists, mtime, size))
+    return out
 
-    if not all([model, team_factors, elo_ratings, all_matches]):
-        raise FileNotFoundError("أحد النماذج أو ملفات البيانات اللازمة لنموذج الخبير غير موجود.")
-
-    # اختيار آخر موسم متاح للنماذج
-    predictor = get_predictor() # نستعير منه دالة اختيار الموسم
-    season_key = predictor._select_season_key(comp_code)
-    
-    h_id_str, a_id_str = str(home_team_id), str(away_team_id)
-    
-    # معالجة مشكلة المنطقة الزمنية باستخدام UTC
-    prediction_date = datetime.now(timezone.utc)
-
-    season_factors = team_factors.get(season_key)
-    season_elo = elo_ratings.get(season_key)
-
-    if not season_factors or not season_elo:
-        raise ValueError(f"لم يتم العثور على نماذج إحصائية للموسم {season_key} اللازمة للنموذج الخبير.")
-
-    # حساب "فورمة" الفريق حتى تاريخ اليوم
-    home_form = calculate_team_form(all_matches, home_team_id, prediction_date, num_matches=5)
-    away_form = calculate_team_form(all_matches, away_team_id, prediction_date, num_matches=5)
-
-    # بناء الميزات
-    features_dict = {
-        'home_attack': [season_factors.get("attack", {}).get(h_id_str, 1.0)],
-        'away_attack': [season_factors.get("attack", {}).get(a_id_str, 1.0)],
-        'home_defense': [season_factors.get("defense", {}).get(h_id_str, 1.0)],
-        'away_defense': [season_factors.get("defense", {}).get(a_id_str, 1.0)],
-        'home_elo': [season_elo.get(h_id_str, 1500.0)],
-        'away_elo': [season_elo.get(a_id_str, 1500.0)],
-        'elo_diff': [season_elo.get(h_id_str, 1500.0) - season_elo.get(a_id_str, 1500.0)],
-        'home_avg_points': [home_form.get("avg_points", 1.0)],
-        'away_avg_points': [away_form.get("avg_points", 1.0)],
-    }
-    features_df = pd.DataFrame.from_dict(features_dict)
-
-    # إجراء التنبؤ
-    probs = model.predict_proba(features_df)[0]
-    
-    # فئات النموذج هي [-1, 0, 1] والتي تترجم إلى [away_win, draw, home_win]
-    return {"away_win": probs[0], "draw": probs[1], "home_win": probs[2], "model_inputs": features_dict}
-
-
-# دالة مساعدة لإظهار زر التحميل
-def show_download_button(file_path: Path):
-    if file_path.exists():
-        with open(file_path, "rb") as fp:
-            st.download_button(
-                label=f"📥 تحميل {file_path.name}",
-                data=fp,
-                file_name=file_path.name,
-                mime="application/octet-stream"
-            )
-
-# ==============================================================================
-# واجهة المستخدم الرئيسية لـ Streamlit
-# ==============================================================================
-
+# -----------------------------------------------------------------------------
+# واجهة المستخدم
+# -----------------------------------------------------------------------------
 st.title("⚽ لوحة تحكم متكاملة لتوقع نتائج المباريات")
-st.caption("Dixon–Coles + Team Factors + ELO + XGBoost Model")
+st.caption("Dixon–Coles + Team Factors + ELO + XGBoost | الإصدار: " + str(getattr(config, "VERSION", "N/A")))
 
 # --- الشريط الجانبي (Sidebar) ---
 with st.sidebar:
     st.header("إدارة البيانات والنماذج")
-    st.info("يجب تشغيل العمليات بالترتيب لضمان عمل التطبيق بشكل صحيح.")
+    st.info("يُفضّل تشغيل العمليات بالترتيب لضمان عمل التطبيق بشكل صحيح.")
 
-    # --- قسم النماذج الإحصائية الأساسية ---
-    with st.expander("1. بناء البيانات والنماذج الإحصائية", expanded=True):
-        years = st.number_input("عدد المواسم المطلوب جلبها", min_value=1, max_value=20, value=3, step=1)
-        
-        if st.button("تشغيل بناء البيانات (01)"):
-            with st.spinner("⏳ جارٍ بناء قاعدة البيانات..."):
-                ok, logs = run_cli_script([sys.executable, "01_pipeline.py", "--years", str(years)])
-                st.cache_data.clear()
-            st.success("✅ اكتملت عملية بناء البيانات.") if ok else st.error("❌ فشل بناء البيانات.")
-            with st.expander("عرض سجلات التنفيذ"): st.code(logs)
-            if ok:
-                show_download_button(config.DATA_DIR / "matches.json")
-                show_download_button(config.DATA_DIR / "teams.json")
+    st.subheader("1. النماذج الإحصائية (أساسي)")
+    years = st.number_input("عدد المواسم المطلوب جلبها", min_value=1, max_value=20, value=3, step=1)
 
-        if st.button("تدريب النماذج الإحصائية (02)"):
-            with st.spinner("⏳ جارٍ تدريب النماذج الإحصائية..."):
-                ok, logs = run_cli_script([sys.executable, "02_trainer.py"])
-                st.cache_data.clear()
-            st.success("✅ اكتمل تدريب النماذج الإحصائية.") if ok else st.error("❌ فشل تدريب النماذج.")
-            with st.expander("عرض سجلات التنفيذ"): st.code(logs)
-            if ok:
-                show_download_button(config.MODELS_DIR / "team_factors.json")
-                show_download_button(config.MODELS_DIR / "elo_ratings.json")
-                show_download_button(config.MODELS_DIR / "league_averages.json")
+    if st.button("تشغيل بناء البيانات (01_pipeline)"):
+        with st.spinner("⏳ جارٍ بناء قاعدة البيانات... هذه العملية قد تستغرق عدة دقائق."):
+            ok, logs = run_cli_script([sys.executable, "01_pipeline.py", "--years", str(years)])
+        safe_clear_cache()
+        st.success("✅ اكتملت عملية بناء البيانات.") if ok else st.error("❌ فشل بناء البيانات.")
+        with st.expander("عرض سجلات التنفيذ"):
+            st.code(logs)
 
-    # --- قسم نماذج تعلم الآلة ---
-    with st.expander("2. بناء نماذج تعلم الآلة (متقدم)"):
-        if st.button("إنشاء ميزات التدريب (04)"):
-            with st.spinner("⏳ جارٍ إنشاء ملف الميزات..."):
-                ok, logs = run_cli_script([sys.executable, "04_feature_generator.py"])
-            st.success("✅ تم إنشاء ملف الميزات.") if ok else st.error("❌ فشل إنشاء الميزات.")
-            with st.expander("عرض سجلات التنفيذ"): st.code(logs)
-            if ok:
-                show_download_button(config.DATA_DIR / "ml_dataset.csv")
-
-        if st.button("تدريب نموذج ML (05_المُعلّم)"):
-            with st.spinner("⏳ جارٍ تدريب نموذج XGBoost..."):
-                ok, logs = run_cli_script([sys.executable, "05_train_ml_model.py"])
-                st.cache_data.clear()
-            st.success("✅ اكتمل تدريب نموذج تعلم الآلة.") if ok else st.error("❌ فشل التدريب.")
-            with st.expander("عرض سجلات التنفيذ"): st.code(logs)
-            if ok:
-                show_download_button(config.MODELS_DIR / "xgboost_model.json")
+    if st.button("تدريب النماذج الإحصائية (02_trainer)"):
+        with st.spinner("⏳ جارٍ تدريب النماذج الإحصائية (Elo, Factors, Rho)..."):
+            ok, logs = run_cli_script([sys.executable, "02_trainer.py"])
+        safe_clear_cache()
+        st.success("✅ اكتمل تدريب النماذج الإحصائية.") if ok else st.error("❌ فشل تدريب النماذج.")
+        with st.expander("عرض سجلات التنفيذ"):
+            st.code(logs)
 
     st.divider()
-    if st.button("🔄 تحديث الكاش بالكامل"):
-        st.cache_data.clear()
-        st.cache_resource.clear()
+
+    st.subheader("2. نماذج تعلم الآلة (متقدم)")
+    if st.button("إجراء الاختبار التاريخي (03_backtester)"):
+        with st.spinner("⏳ جارٍ إجراء الاختبار التاريخي لتقييم النموذج..."):
+            ok, logs = run_cli_script([sys.executable, "03_backtester.py"])
+        st.success("✅ اكتمل الاختبار التاريخي.") if ok else st.error("❌ فشل الاختبار.")
+        with st.expander("عرض سجلات التنفيذ"):
+            st.code(logs)
+
+    if st.button("إنشاء ميزات التدريب (04_feature_generator)"):
+        with st.spinner("⏳ جارٍ إنشاء ملف الميزات لنموذج تعلم الآلة..."):
+            ok, logs = run_cli_script([sys.executable, "04_feature_generator.py"])
+        st.success("✅ تم إنشاء ملف الميزات بنجاح.") if ok else st.error("❌ فشل إنشاء الميزات.")
+        with st.expander("عرض سجلات التنفيذ"):
+            st.code(logs)
+
+    if st.button("تدريب نموذج ML (05_train_ml_model)"):
+        st.warning("تأكد من إنشاء ملف الميزات أولاً. هذه العملية قد تستغرق بعض الوقت.")
+        with st.spinner("⏳ جارٍ تدريب نموذج XGBoost..."):
+            ok, logs = run_cli_script([sys.executable, "05_train_ml_model.py"])
+        safe_clear_cache()
+        st.success("✅ اكتمل تدريب نموذج تعلم الآلة.") if ok else st.error("❌ فشل التدريب.")
+        with st.expander("عرض سجلات التنفيذ"):
+            st.code(logs)
+
+    if st.button("تشغيل توقع ML (06_predict_ml)"):
+        st.info("سيتم تشغيل التوقع للمباراة المحددة داخل ملف 06_predict_ml.py.")
+        with st.spinner("⏳ جارٍ تشغيل خبير تعلم الآلة للتنبؤ..."):
+            ok, logs = run_cli_script([sys.executable, "06_predict_ml.py"])
+        st.success("✅ تم تشغيل الخبير بنجاح.") if ok else st.error("❌ فشل تشغيل الخبير.")
+        with st.expander("عرض سجلات التنفيذ"):
+            st.code(logs)
+
+    st.divider()
+    st.header("إعدادات التنبؤ")
+    use_elo = st.checkbox("تفعيل تعديل ELO في λ", value=True)
+    topk = st.slider("أظهر أعلى K من النتائج المحتملة", min_value=0, max_value=10, value=5)
+
+    if st.button("🔄 تحديث الكاش"):
+        safe_clear_cache()
         st.success("تم مسح الكاش بنجاح!")
 
-# --- قسم التنبؤ الرئيسي ---
-st.header("🔮 اختر مباراة وتنبأ بالنتيجة")
+# -----------------------------------------------------------------------------
+# تشخيص سريع لحالة الملفات
+# -----------------------------------------------------------------------------
+with st.expander("🩺 تشخيص الحالة (الملفات والجاهزية)", expanded=False):
+    info = model_file_info()
+    cols = st.columns(3)
+    for i, (name, p, exists, mtime, size) in enumerate(info):
+        with cols[i % 3]:
+            if exists:
+                ts = datetime.fromtimestamp(mtime).strftime("%Y-%m-%d %H:%M") if mtime else "-"
+                st.success(f"{name}\n{p}")
+                st.caption(f"آخر تحديث: {ts} | حجم: {size or 0} بايت")
+            else:
+                st.error(f"{name} غير متوفر")
+                st.caption(str(p))
 
+# -----------------------------------------------------------------------------
+# قسم التنبؤ الرئيسي
+# -----------------------------------------------------------------------------
+st.header("تنبؤ المباراة (النموذج الإحصائي)")
 teams_map = load_teams_map()
 if not teams_map:
-    st.error("لم يتم العثور على ملف بيانات الفرق `teams.json`. يرجى تشغيل 'بناء البيانات' من الشريط الجانبي أولاً.")
+    st.error("لم يتم العثور على ملف بيانات الفرق teams.json. يرجى تشغيل 'بناء البيانات' من الشريط الجانبي أولاً.")
     st.stop()
 
-comp_code = st.selectbox("اختر المسابقة", options=config.TARGET_COMPETITIONS, index=0)
-comp_teams = teams_for_comp(teams_map, comp_code)
+models = load_models()
+missing_models = [k for k, v in models.items() if not v]
+if missing_models:
+    st.warning(f"بعض ملفات النماذج غير متوفرة: {', '.join(missing_models)}. قد تحتاج لتشغيل تدريب النماذج الإحصائية.")
 
+# اختيار المسابقة والفرق
+comp_code = st.selectbox("اختر المسابقة", options=getattr(config, "TARGET_COMPETITIONS", []), index=0 if getattr(config, "TARGET_COMPETITIONS", []) else 0)
+
+comp_teams = teams_for_comp(teams_map, comp_code) if comp_code else []
 if not comp_teams:
     st.warning(f"لم يتم العثور على فرق لمسابقة '{comp_code}'. قد تحتاج لتشغيل بناء البيانات.")
     st.stop()
 
 names = [n for n, _ in comp_teams]
-name_to_id = {n: tid for n, tid in comp_teams}
 
 c1, c2 = st.columns(2)
 with c1:
@@ -257,55 +253,44 @@ if team1_name == team2_name:
     st.warning("يرجى اختيار فريقين مختلفين.")
     st.stop()
 
-home_team_id = name_to_id.get(team1_name)
-away_team_id = name_to_id.get(team2_name)
+if st.button("🔮 احسب التنبؤ الآن", type="primary"):
+    try:
+        result = compute_prediction(team1_name, team2_name, comp_code, use_elo=use_elo, topk=topk)
 
-# --- Tabs للتنبؤ ---
-stat_tab, ml_tab = st.tabs(["📊 التنبؤ الإحصائي", "🧠 التنبؤ بالخبير (ML)"])
+        st.markdown(f"### {result.get('match', f'{team1_name} vs {team2_name}')}")
+        meta = result.get("meta", {})
+        st.caption(f"المسابقة: {result.get('competition', comp_code)} | الموسم المستخدم للنموذج: {meta.get('model_season_used', 'N/A')}")
 
-with stat_tab:
-    st.subheader("إعدادات النموذج الإحصائي")
-    use_elo = st.checkbox("تفعيل تعديل ELO في λ", value=True, key="stat_elo")
-    topk = st.slider("أظهر أعلى K من النتائج المحتملة", min_value=0, max_value=10, value=5, key="stat_topk")
+        p_home = float(result["probabilities"]["home_win"])
+        p_draw = float(result["probabilities"]["draw"])
+        p_away = float(result["probabilities"]["away_win"])
 
-    if st.button("احسب التنبؤ الإحصائي", type="primary"):
-        try:
-            result = compute_statistical_prediction(team1_name, team2_name, comp_code, use_elo=use_elo, topk=topk)
-            st.markdown(f"#### {result['match']}")
-            p_home, p_draw, p_away = result["probabilities"]["home_win"], result["probabilities"]["draw"], result["probabilities"]["away_win"]
+        col1, col2, col3 = st.columns(3)
+        col1.metric("فوز المضيف", f"{p_home*100:.1f}%")
+        col2.metric("تعادل", f"{p_draw*100:.1f}%")
+        col3.metric("فوز الضيف", f"{p_away*100:.1f}%")
 
-            col1, col2, col3 = st.columns(3)
-            col1.metric("فوز المضيف", f"{p_home*100:.1f}%")
-            col2.metric("تعادل", f"{p_draw*100:.1f}%")
-            col3.metric("فوز الضيف", f"{p_away*100:.1f}%")
+        # أعلى K من النتائج المحتملة
+        if topk and "top_scorelines" in result:
+            st.subheader(f"أعلى {topk} نتائج محتملة")
+            rows = [
+                {
+                    "النتيجة": f"{s['home_goals']} - {s['away_goals']}",
+                    "الاحتمال": f"{s['prob']*100:.2f}%"
+                }
+                for s in result["top_scorelines"]
+            ]
+            st.table(rows)
 
-            if topk and "top_scorelines" in result:
-                st.write(f"**أعلى {topk} نتائج محتملة:**")
-                rows = [{"النتيجة": f"{s['home_goals']} - {s['away_goals']}", "الاحتمال": f"{s['prob']*100:.2f}%"} for s in result["top_scorelines"]]
-                st.table(rows)
-            with st.expander("عرض مدخلات النموذج الإحصائي"): st.json(result["model_inputs"])
-        except Exception as e:
-            st.error(f"فشل التنبؤ الإحصائي: {e}")
+        # مدخلات النموذج وتفاصيل
+        with st.expander("عرض مدخلات النموذج"):
+            st.json(result.get("model_inputs", {}))
 
-with ml_tab:
-    st.info("يستخدم هذا النموذج مخرجات النماذج الإحصائية كميزات لتدريب نموذج XGBoost أكثر قوة.")
-    if st.button("🧠 احسب التنبؤ (نموذج الخبير)", type="primary"):
-        if not load_xgboost_model():
-             st.error("نموذج الخبير (XGBoost) غير موجود. يرجى تدريبه أولاً من الشريط الجانبي (الخطوة 05).")
-        else:
-            try:
-                with st.spinner("...جارٍ حساب تنبؤ الخبير"):
-                    result = compute_ml_prediction(home_team_id, away_team_id, comp_code)
-                st.markdown(f"#### {team1_name} (المضيف) ضد {team2_name} (الضيف)")
-                p_home, p_draw, p_away = result["home_win"], result["draw"], result["away_win"]
+        with st.expander("تفاصيل الفرق (IDs)"):
+            st.json(result.get("teams_found", {}))
 
-                col1, col2, col3 = st.columns(3)
-                col1.metric("فوز المضيف", f"{p_home*100:.1f}%")
-                col2.metric("تعادل", f"{p_draw*100:.1f}%")
-                col3.metric("فوز الضيف", f"{p_away*100:.1f}%")
-                
-                with st.expander("عرض الميزات المستخدمة في التنبؤ"): 
-                    st.json(result["model_inputs"])
+        with st.expander("النتيجة الكاملة (JSON)"):
+            st.code(json.dumps(result, ensure_ascii=False, indent=2))
 
-            except Exception as e:
-                st.error(f"فشل تنبؤ الخبير: {e}")
+    except Exception as e:
+        st.error(f"فشل التنبؤ: {e}")
