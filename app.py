@@ -2,6 +2,7 @@
 # -----------------------------------------------------------------------------
 # لوحة Streamlit لإدارة خط أنابيب البيانات والنماذج، مع أزرار تحميل الملفات
 # بعد كل عملية، بالإضافة إلى واجهة تنبؤ إحصائي وتنبؤ بنموذج تعلّم الآلة.
+# + إصلاح مقارنة التواريخ (naive vs aware) عبر توحيدها إلى Naive-UTC.
 # -----------------------------------------------------------------------------
 
 import sys
@@ -10,7 +11,7 @@ import io
 import json
 import zipfile
 import subprocess
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, List, Tuple, Optional
 
@@ -32,15 +33,35 @@ from common import config
 from common.utils import log
 from predictor import Predictor
 
+# -----------------------------------------------------------------------------
+# توحيد التواريخ إلى Naive-UTC لمنع أخطاء المقارنة
+# -----------------------------------------------------------------------------
+def to_naive_utc(dt: Optional[datetime]) -> Optional[datetime]:
+    if dt is None:
+        return None
+    try:
+        if dt.tzinfo is None:
+            return dt  # Naive بالفعل
+        return dt.astimezone(timezone.utc).replace(tzinfo=None)
+    except Exception:
+        return dt
+
 # محاولة استيراد calculate_team_form وإن لم تتوفر نستخدم بديل بسيط
 try:
-    from common.modeling import calculate_team_form
-except Exception:
+    from common.modeling import calculate_team_form as _calculate_team_form_base
     def calculate_team_form(all_matches, team_id: int, ref_date: datetime, num_matches: int = 5):
-        from common.utils import parse_date_safe, parse_score
+        # نطبّع ref_date قبل تمريره لاحتمال المقارنات الداخلية
+        ref_date = to_naive_utc(ref_date)
+        return _calculate_team_form_base(all_matches, team_id, ref_date, num_matches=num_matches)
+except Exception:
+    from common.utils import parse_date_safe, parse_score
+    def calculate_team_form(all_matches, team_id: int, ref_date: datetime, num_matches: int = 5):
+        # Fallback: توحيد التواريخ إلى Naive-UTC قبل المقارنة
+        ref_date = to_naive_utc(ref_date)
         rows = []
         for m in all_matches:
             dt = parse_date_safe(m.get("utcDate"))
+            dt = to_naive_utc(dt)
             if not dt or dt >= ref_date:
                 continue
             h = m.get("homeTeam", {}).get("id")
@@ -53,10 +74,8 @@ except Exception:
             if hg is None:
                 continue
             if int(h) == team_id:
-                # Home perspective
                 pts = 3 if hg > ag else (1 if hg == ag else 0)
             else:
-                # Away perspective
                 pts = 3 if ag > hg else (1 if hg == ag else 0)
             rows.append((dt, pts))
         rows.sort(key=lambda x: x[0], reverse=True)
@@ -151,11 +170,8 @@ def _primary_name(names: List[str]) -> str:
     names = [n for n in (names or []) if n]
     if not names:
         return "Unknown"
-
     def score(n: str) -> Tuple[int, int, int]:
-        # تفضيل الأسماء التي تحتوي فراغ (أقرب للاسم الكامل)، الأطول، وغير الكبيرة بالكامل
         return (int(" " in n), len(n), -int(n.isupper()))
-
     return sorted(names, key=score, reverse=True)[0]
 
 def teams_for_comp(teams_map: Dict, comp_code: str) -> List[Tuple[str, int]]:
@@ -317,7 +333,6 @@ with st.sidebar:
     backtester_logs = None
     if st.button("إجراء الاختبار التاريخي (03_backtester)"):
         with st.spinner("⏳ جارٍ إجراء الاختبار التاريخي لتقييم النموذج..."):
-            # نفعّل خيار الحفظ كي نوفّر ملف التحميل
             ok, backtester_logs = run_cli_script([sys.executable, "03_backtester.py", "--save"])
         st.success("✅ اكتمل الاختبار التاريخي.") if ok else st.error("❌ فشل الاختبار.")
 
@@ -502,7 +517,8 @@ with st.container():
                 raise RuntimeError("تعذّر تحديد IDs للفرق المختارة.")
 
             h_id_str, a_id_str = str(h_id), str(a_id)
-            prediction_date = datetime.now()
+            # نستخدم aware-UTC ثم نطبّع إلى Naive-UTC داخل دالة الفورمة
+            prediction_date = datetime.now(timezone.utc)
 
             home_form = calculate_team_form(all_matches, int(h_id), prediction_date, num_matches=5)
             away_form = calculate_team_form(all_matches, int(a_id), prediction_date, num_matches=5)
