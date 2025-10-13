@@ -3,7 +3,6 @@
 # الوصف:
 # السكريبت النهائي للتنبؤ بنتيجة مباراة قادمة باستخدام نموذج XGBoost المدرب.
 # -----------------------------------------------------------------------------
-
 import json
 import pandas as pd
 import xgboost as xgb
@@ -14,11 +13,8 @@ from common import config
 from common.utils import log
 from common.modeling import calculate_team_form
 
-
 def predict_match(home_team_id: int, away_team_id: int, competition_code: str, season_start_year: int):
-    """
-    الدالة الرئيسية للتنبؤ بمباراة واحدة محددة.
-    """
+    """ الدالة الرئيسية للتنبؤ بمباراة واحدة محددة. """
     log(f"--- بدء التنبؤ للمباراة: {home_team_id} vs {away_team_id} ---", "INFO")
 
     # --- 1. تحميل جميع النماذج والبيانات المطلوبة ---
@@ -33,7 +29,6 @@ def predict_match(home_team_id: int, away_team_id: int, competition_code: str, s
         # تحميل نموذج تعلم الآلة
         model = xgb.XGBClassifier()
         model.load_model(config.MODELS_DIR / "xgboost_model.json")
-        
     except (IOError, xgb.core.XGBoostError) as e:
         log(f"فشل في تحميل أحد الملفات المطلوبة: {e}. يرجى تشغيل السكريبتات السابقة.", "CRITICAL")
         return
@@ -45,7 +40,6 @@ def predict_match(home_team_id: int, away_team_id: int, competition_code: str, s
 
     season_factors = team_factors.get(season_key)
     season_elo = elo_ratings.get(season_key)
-
     if not season_factors or not season_elo:
         log(f"لم يتم العثور على نماذج إحصائية للموسم {season_key}. لا يمكن المتابعة.", "ERROR")
         return
@@ -64,20 +58,17 @@ def predict_match(home_team_id: int, away_team_id: int, competition_code: str, s
         'home_avg_points': [home_form.get("avg_points", 1.0)],
         'away_avg_points': [away_form.get("avg_points", 1.0)],
     }
-    
     features_df = pd.DataFrame.from_dict(features_dict)
     log("الميزات التي تم إنشاؤها للمباراة:", "DEBUG")
     print(features_df)
 
     # --- 3. إجراء التنبؤ باستخدام نموذج XGBoost ---
     log("إجراء التنبؤ باستخدام نموذج تعلم الآلة...", "INFO")
-    
     predicted_probabilities = model.predict_proba(features_df)
-    
+
     # الترتيب: (-1 -> 0), (0 -> 1), (1 -> 2)
     le = LabelEncoder()
     le.fit([-1, 0, 1])
-    
     prob_away = float(predicted_probabilities[0][le.transform([-1])[0]])
     prob_draw = float(predicted_probabilities[0][le.transform([0])[0]])
     prob_home = float(predicted_probabilities[0][le.transform([1])[0]])
@@ -91,16 +82,12 @@ def predict_match(home_team_id: int, away_team_id: int, competition_code: str, s
     print(f" - احتمال فوز الفريق الضيف: {prob_away:.2%}")
     print("="*40 + "\n")
 
-
 if __name__ == "__main__":
-    # --------------------------------------------------------------------------
-    # إعدادات المباراة المستهدفة
-    # --------------------------------------------------------------------------
-    TARGET_HOME_TEAM_ID = 65    # مثال: Manchester City
-    TARGET_AWAY_TEAM_ID = 64    # مثال: Liverpool
-    TARGET_COMP_CODE = "PL"     # رمز المسابقة
-    TARGET_SEASON_YEAR = 2025   # سنة بداية الموسم
-    # --------------------------------------------------------------------------
+    # مثال: TARGET_HOME_TEAM_ID = 65  # Manchester City
+    TARGET_HOME_TEAM_ID = 65
+    TARGET_AWAY_TEAM_ID = 64  # Liverpool
+    TARGET_COMP_CODE = "PL"
+    TARGET_SEASON_YEAR = 2025
 
     predict_match(
         home_team_id=TARGET_HOME_TEAM_ID,
