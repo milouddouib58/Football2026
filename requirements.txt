@@ -1,15 +1,84 @@
-# requirements.txt (النسخة الكاملة)
+# requirements.txt
+# -----------------------------------------------------------------------------
+# متطلبات مشروع التنبؤ بنتائج كرة القدم
+# Football Match Predictor - Dependencies
+#
+# التثبيت:
+#   pip install -r requirements.txt
+#
+# إنشاء بيئة افتراضية (مُوصى به):
+#   python -m venv venv
+#   source venv/bin/activate        # Linux/macOS
+#   venv\Scripts\activate           # Windows
+#   pip install -r requirements.txt
+#
+# تحديث المكتبات:
+#   pip install --upgrade -r requirements.txt
+#
+# تصدير المكتبات المثبتة فعلياً:
+#   pip freeze > requirements.lock
+# -----------------------------------------------------------------------------
 
-# Core libraries for data fetching and handling
-requests>=2.31.0,<3
-python-dotenv>=1.0.0,<2
-urllib3>=1.26,<3
+
+# =============================================================================
+# 1. مكتبات أساسية (Core)
+# =============================================================================
+
+# NumPy — حسابات عددية (مصفوفات، عمليات خطية)
+# مستخدمة مباشرة في: 02_trainer, 03_backtester, 04_feature_generator,
+#                     05_train_ml_model, predictor.py, app.py
+# ملاحظة: هي تبعية لـ pandas/scipy/sklearn أيضاً، لكنها مستوردة مباشرة
+numpy>=1.24.0,<3
+
+# Pandas — معالجة وتحليل البيانات (DataFrames)
+# مستخدمة في: 04_feature_generator, 05_train_ml_model, 06_predict_ml, app.py
 pandas>=2.0.0,<3
 
-# Libraries for modeling and machine learning
+
+# =============================================================================
+# 2. مكتبات جلب البيانات (Data Fetching)
+# =============================================================================
+
+# Requests — إرسال طلبات HTTP لواجهة football-data.org API
+# مستخدمة في: common/api_client.py
+requests>=2.31.0,<3
+
+# urllib3 — عميل HTTP منخفض المستوى (تبعية لـ requests)
+# مُدرجة صراحة لضبط الإصدار ومنع تعارضات
+urllib3>=1.26.0,<3
+
+# python-dotenv — تحميل متغيرات البيئة من ملف .env
+# مستخدمة في: common/config.py (لقراءة API_KEY)
+python-dotenv>=1.0.0,<2
+
+
+# =============================================================================
+# 3. مكتبات النمذجة الإحصائية (Statistical Modeling)
+# =============================================================================
+
+# SciPy — توزيعات إحصائية ودوال تحسين
+# مستخدمة في: common/modeling.py (poisson.pmf), 02_trainer.py
 scipy>=1.10.0,<2
+
+
+# =============================================================================
+# 4. مكتبات تعلم الآلة (Machine Learning)
+# =============================================================================
+
+# scikit-learn — أدوات تعلم آلة (تقسيم، تقييم، ترميز)
+# مستخدمة في: 05_train_ml_model.py (train_test_split, classification_report,
+#              accuracy_score, confusion_matrix, StratifiedKFold, cross_val_score)
 scikit-learn>=1.3.0,<2
+
+# XGBoost — نموذج Gradient Boosting للتصنيف
+# مستخدم في: 05_train_ml_model.py, 06_predict_ml.py, app.py
 xgboost>=2.0.0,<3
 
-# Library for the web user interface
+
+# =============================================================================
+# 5. مكتبات واجهة المستخدم (User Interface)
+# =============================================================================
+
+# Streamlit — لوحة تحكم تفاعلية عبر المتصفح
+# مستخدمة في: app.py
 streamlit>=1.36.0,<2
