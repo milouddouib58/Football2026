@@ -1,35 +1,33 @@
-# 03_backtester.py
+# 02_trainer.py
 # -----------------------------------------------------------------------------
 # الوصف:
-# - باكتيستر زمني للموديل الإحصائي (Dixon–Coles + Team Factors + ELO).
-# - يقيس LogLoss/Brier/ECE عبر مواسم/دوريات بنهج نافذة زمنية متوسعة
-#   (expanding window).
-# - توليف بسيط لمعاملات:
-#     * TEAM_FACTORS_HALFLIFE_DAYS
-#     * TEAM_FACTORS_PRIOR_GLOBAL
-#     * TEAM_FACTORS_TEAM_PRIOR_WEIGHT
-#     * DC_RHO_MAX
-# - يطبع أفضل الإعدادات ويقترح قيمًا لتثبيتها في common.config.
+# هذا السكريبت هو "العقل" الخاص بالمشروع. يقوم بتنفيذ الخطوات التالية:
+# 1. تحميل بيانات المباريات الخام من matches.json.
+# 2. تجميع المباريات حسب الموسم الحقيقي لكل دوري.
+# 3. لكل موسم على حدة:
+#    أ. البحث عن أفضل مجموعة من المعاملات (Hyperparameters) باستخدام تقييم
+#       Log-Loss حقيقي على مجموعة تحقق منفصلة.
+#    ب. تدريب النماذج الإحصائية النهائية على كامل بيانات الموسم باستخدام أفضل
+#       المعاملات التي تم العثور عليها.
+# 4. حفظ النماذج المدربة النهائية في مجلد `models/`.
 #
 # التحسينات:
-# - إصلاح خلط احتمالات فوز المضيف/الضيف (triu vs tril)
-# - إصلاح عدم تحديث prior الموسم السابق (prev_prior_by_comp)
-# - إصلاح المتغيرات المحسوبة وغير المستخدمة في compute_lambdas_for_match
-# - إضافة تجميع دقيق للاحتمالات والملصقات بدلاً من المعدل المرجّح فقط
-# - حماية من القيم غير الصالحة (None, NaN, Inf)
+# - إصلاح الاستيراد (from common import config بدلاً من from common.config)
+# - إضافة دالة load_matches المفقودة
+# - إكمال دالة save_models
+# - إضافة حماية من القيم السالبة في مصفوفة الاحتمالات (Dixon-Coles tau)
 # - إضافة نسخ احتياطية قبل الحفظ
-# - إضافة تقرير مفصّل بعد انتهاء العملية
-# - إضافة شريط تقدم وتسجيل أوضح
-# - إضافة معالجة أخطاء تفصيلية
+# - حفظ بيانات وصفية (metadata) مع النماذج
+# - إضافة تتبع التقدم في البحث عن المعاملات
+# - معالجة أخطاء أكثر تفصيلاً
 # - إضافة التحقق من صحة البيانات
-# - إضافة دعم --dry-run
-# - دعم حفظ تقرير نصي قابل للقراءة
+# - دعم معاملات سطر الأوامر
+# - إضافة تقرير تدريب مفصّل
 #
 # الاستخدام:
-#   python 03_backtester.py --save
-#   python 03_backtester.py --comps PL PD --use-elo --save
-#   python 03_backtester.py --grid-halflife 90,180,365 --grid-prior-global 2.0,3.0 --save
-#   python 03_backtester.py --min-train 120 --block-size 40 --limit-seasons 3 --save
+# python 02_trainer.py
+# python 02_trainer.py --skip-tuning
+# python 02_trainer.py --min-matches 30
 # -----------------------------------------------------------------------------
 
 import sys
@@ -37,12 +35,12 @@ import os
 import json
 import shutil
 import argparse
-import math
+import itertools
 import traceback
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Dict, List, Any, Tuple, Optional, Set
 from collections import defaultdict
+from typing import Dict, List, Any, Tuple, Optional, Set
 
 # --- إضافة مسار المشروع الرئيسي إلى بايثون ---
 project_root = os.path.dirname(os.path.abspath(__file__))
@@ -55,9 +53,15 @@ except ImportError:
     print("خطأ: مكتبة numpy غير مثبتة. يرجى تثبيتها: pip install numpy")
     sys.exit(1)
 
+try:
+    from scipy.stats import poisson
+except ImportError:
+    print("خطأ: مكتبة scipy غير مثبتة. يرجى تثبيتها: pip install scipy")
+    sys.exit(1)
+
 # استيراد الوحدات المشتركة
 from common import config
-from common.utils import log, parse_date_safe, parse_score
+from common.utils import log, parse_date_safe
 
 # استيراد دوال النمذجة
 try:
@@ -66,8 +70,6 @@ try:
         build_team_factors,
         build_elo_ratings,
         fit_dc_rho_mle,
-        poisson_matrix_dc,
-        suggest_goal_cutoff,
     )
 except ImportError as e:
     log(f"فشل استيراد وحدة النمذجة (common.modeling): {e}", "CRITICAL")
@@ -78,45 +80,41 @@ except ImportError as e:
 # ثوابت
 # -----------------------------------------------------------------------------
 
-# الحد الأدنى لعدد المباريات في الموسم لقبوله في الباكتيست
-DEFAULT_MIN_SEASON_MATCHES = 30
+# الحد الأدنى لعدد المباريات في الموسم لقبول التدريب
+DEFAULT_MIN_MATCHES_PER_SEASON = 50
 
-# الحد الأدنى لعدد مباريات التدريب قبل أول تقييم
-DEFAULT_MIN_TRAIN = 120
+# الحد الأدنى لعدد مباريات مجموعة التحقق لإجراء البحث
+MIN_VALIDATION_SET_SIZE = 10
 
-# حجم كتلة الاختبار الافتراضي
-DEFAULT_BLOCK_SIZE = 40
+# نسبة تقسيم التدريب/التحقق للبحث عن المعاملات
+TRAIN_VALIDATION_SPLIT = 0.8
 
-# عدد صناديق ECE الافتراضي
-DEFAULT_ECE_BINS = 10
+# الحد الأقصى لعدد الأهداف في نموذج بواسون
+MAX_GOALS = 10
 
 # قيمة صغيرة لمنع log(0)
-LOG_EPSILON = 1e-15
+LOG_EPSILON = 1e-9
+
+# قيمة Log-Loss الافتراضية عند الفشل
+DEFAULT_BAD_LOGLOSS = 999.0
 
 # اسم ملف النسخة الاحتياطية
 BACKUP_SUFFIX = ".backup"
 
-# عدد النسخ الاحتياطية المحتفظ بها
+# عدد النسخ الاحتياطية التي يُحتفظ بها
 MAX_BACKUPS = 3
 
-# القيم الافتراضية لشبكة البحث
-DEFAULT_GRID_HALFLIFE = [90, 180, 365]
-DEFAULT_GRID_PRIOR_GLOBAL = [2.0, 3.0, 5.0]
-DEFAULT_GRID_TEAM_PRIOR_WEIGHT = [0.0, 5.0]
-DEFAULT_GRID_RHO_MAX = [0.15, 0.20]
-DEFAULT_RHO_STEP = 0.002
-
 
 # -----------------------------------------------------------------------------
-# القسم الأول: أدوات تحميل البيانات وتجميعها
+# القسم الأول: دوال تحميل البيانات
 # -----------------------------------------------------------------------------
 
-def load_matches(path: Path) -> List[Dict[str, Any]]:
+def load_matches(matches_path: Path) -> List[Dict[str, Any]]:
     """
     تحميل بيانات المباريات من ملف JSON.
 
     المعاملات:
-        path: مسار ملف matches.json
+        matches_path: مسار ملف matches.json
 
     العائد:
         قائمة المباريات
@@ -125,479 +123,744 @@ def load_matches(path: Path) -> List[Dict[str, Any]]:
         FileNotFoundError: إذا لم يكن الملف موجوداً
         json.JSONDecodeError: إذا كان الملف تالفاً
     """
-    if not path.exists():
+    if not matches_path.exists():
         raise FileNotFoundError(
-            f"ملف المباريات غير موجود: {path}. "
+            f"ملف المباريات غير موجود: {matches_path}. "
             f"يرجى تشغيل 01_pipeline.py أولاً."
         )
 
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            data = json.load(f)
+    log(f"جارٍ تحميل المباريات من: {matches_path}", "INFO")
 
-        if not isinstance(data, list):
-            raise ValueError(
-                f"تنسيق ملف المباريات غير متوقع: المتوقع قائمة، الموجود {type(data).__name__}"
-            )
+    with open(matches_path, "r", encoding="utf-8") as f:
+        data = json.load(f)
 
-        log(f"تم تحميل {len(data)} مباراة من: {path}", "INFO")
-        return data
+    if not isinstance(data, list):
+        raise ValueError(f"تنسيق ملف المباريات غير متوقع: المتوقع قائمة، الموجود {type(data).__name__}")
 
-    except json.JSONDecodeError as e:
-        log(f"خطأ في تحليل ملف المباريات: {e}", "CRITICAL")
-        raise
-    except Exception as e:
-        log(f"تعذّر تحميل matches.json: {e}", "CRITICAL")
-        raise
+    log(f"تم تحميل {len(data)} مباراة بنجاح.", "INFO")
+    return data
 
 
-def group_matches_by_season(
-    matches: List[Dict[str, Any]]
-) -> Dict[str, List[Dict[str, Any]]]:
+def validate_match_for_training(match: Dict) -> bool:
     """
-    تجميع المباريات في قاموس حسب الموسم.
-    كل مفتاح يمثّل "رمز_المسابقة_سنة_البداية" (مثلاً "PL_2024").
+    التحقق من صلاحية مباراة واحدة للتدريب.
+    يجب أن تحتوي على تاريخ ونتيجة وفريقين.
 
-    يتم استخدام season.startDate لتحديد سنة بداية الموسم.
-    المباريات داخل كل موسم تُرتّب زمنياً.
+    المعاملات:
+        match: بيانات المباراة
+
+    العائد:
+        True إذا كانت المباراة صالحة للتدريب
+    """
+    # يجب أن تكون قاموساً
+    if not isinstance(match, dict):
+        return False
+
+    # يجب أن تحتوي على تاريخ
+    utc_date = match.get("utcDate")
+    if not utc_date:
+        return False
+
+    parsed_date = parse_date_safe(utc_date)
+    if parsed_date is None:
+        return False
+
+    # يجب أن تحتوي على فريقين بمعرّفات
+    home_team = match.get("homeTeam", {})
+    away_team = match.get("awayTeam", {})
+
+    if not isinstance(home_team, dict) or not isinstance(away_team, dict):
+        return False
+
+    if "id" not in home_team or "id" not in away_team:
+        return False
+
+    # يجب أن تحتوي على نتيجة (score)
+    score = match.get("score", {})
+    if not isinstance(score, dict):
+        return False
+
+    # يجب أن يكون لها فائز محدد (HOME_TEAM, DRAW, AWAY_TEAM)
+    winner = score.get("winner")
+    if winner not in ("HOME_TEAM", "DRAW", "AWAY_TEAM"):
+        return False
+
+    # يجب أن تكون المباراة منتهية
+    status = match.get("status", "")
+    if status not in ("FINISHED", ""):
+        # بعض المباريات قد لا تحتوي على status ولكن لديها winner
+        if not winner:
+            return False
+
+    return True
+
+
+def filter_valid_matches(matches: List[Dict]) -> List[Dict]:
+    """
+    تصفية المباريات الصالحة للتدريب من قائمة المباريات.
 
     المعاملات:
         matches: قائمة جميع المباريات
 
     العائد:
-        قاموس: مفتاح الموسم -> قائمة المباريات (مرتبة زمنياً)
+        قائمة المباريات الصالحة للتدريب
     """
-    by_season: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
-    skipped = 0
+    valid = [m for m in matches if validate_match_for_training(m)]
 
-    for m in matches:
-        # استخراج رمز المسابقة
-        competition = m.get("competition", {}) or {}
-        comp_code = competition.get("code", "UNK")
-
-        # استخراج سنة بداية الموسم
-        season = m.get("season", {}) or {}
-        start_date_str = season.get("startDate", "")
-
-        if not start_date_str or len(start_date_str) < 4:
-            skipped += 1
-            continue
-
-        season_year = start_date_str[:4]
-
-        # بناء مفتاح الموسم
-        key = f"{comp_code}_{season_year}"
-        by_season[key].append(m)
-
-    if skipped > 0:
+    rejected_count = len(matches) - len(valid)
+    if rejected_count > 0:
         log(
-            f"تم تخطي {skipped} مباراة لعدم وجود بيانات موسم صالحة.",
+            f"تم تصفية {rejected_count} مباراة غير صالحة "
+            f"(من {len(matches)} إلى {len(valid)})",
             "WARNING"
         )
 
-    # ترتيب المباريات داخل كل موسم زمنياً
-    default_date = parse_date_safe("1900-01-01")
-    for key in by_season:
-        by_season[key].sort(
-            key=lambda x: parse_date_safe(x.get("utcDate")) or default_date
-        )
+    return valid
 
-    log(f"تم تجميع المباريات في {len(by_season)} موسم فريد.", "INFO")
+
+# -----------------------------------------------------------------------------
+# القسم الثاني: دوال التجميع والتنظيم
+# -----------------------------------------------------------------------------
+
+def get_season_start_month() -> int:
+    """
+    الحصول على شهر بداية الموسم من الإعدادات.
+
+    العائد:
+        رقم الشهر (مثلاً 7 لشهر يوليو)
+    """
+    return getattr(config, "CURRENT_SEASON_START_MONTH", 7)
+
+
+def determine_season_key(match: Dict) -> Optional[str]:
+    """
+    تحديد مفتاح الموسم لمباراة معيّنة بناءً على تاريخها ورمز مسابقتها.
+
+    المعاملات:
+        match: بيانات المباراة
+
+    العائد:
+        مفتاح الموسم (مثلاً "PL_2024") أو None إذا تعذّر التحديد
+    """
+    # قراءة التاريخ
+    match_date = parse_date_safe(match.get("utcDate"))
+    if match_date is None:
+        return None
+
+    # تحديد سنة بداية الموسم
+    start_month = get_season_start_month()
+    if match_date.month >= start_month:
+        season_start_year = match_date.year
+    else:
+        season_start_year = match_date.year - 1
+
+    # قراءة رمز المسابقة
+    comp_code = match.get("competition", {}).get("code", "UNK")
+
+    return f"{comp_code}_{season_start_year}"
+
+
+def group_matches_by_season(matches: List[Dict]) -> Dict[str, List[Dict]]:
+    """
+    تجميع المباريات في قاموس حسب الموسم.
+    كل مفتاح يمثّل "رمز_المسابقة_سنة_البداية" (مثلاً "PL_2024").
+
+    المعاملات:
+        matches: قائمة جميع المباريات
+
+    العائد:
+        قاموس: مفتاح الموسم -> قائمة المباريات
+    """
+    matches_by_season: Dict[str, List[Dict]] = defaultdict(list)
+
+    skipped = 0
+    for match in matches:
+        season_key = determine_season_key(match)
+        if season_key is None:
+            skipped += 1
+            continue
+        matches_by_season[season_key].append(match)
+
+    if skipped > 0:
+        log(f"تم تخطي {skipped} مباراة لعدم إمكانية تحديد موسمها.", "WARNING")
+
+    log(f"تم تجميع المباريات في {len(matches_by_season)} موسم فريد.", "INFO")
 
     # عرض تفاصيل كل موسم
-    for key in sorted(by_season.keys()):
-        count = len(by_season[key])
-        log(f"  {key}: {count} مباراة", "DEBUG")
+    for key in sorted(matches_by_season.keys()):
+        count = len(matches_by_season[key])
+        log(f"  {key}: {count} مباراة", "INFO")
 
-    return dict(by_season)
+    return dict(matches_by_season)
 
 
-def season_key_parts(sk: str) -> Tuple[str, int]:
+def load_and_group_matches() -> Dict[str, List[Dict[str, Any]]]:
+    """
+    تحميل وتجميع المباريات من ملف matches.json.
+    يقوم بتحميل البيانات، تصفية المباريات الصالحة، ثم تجميعها حسب الموسم.
+
+    العائد:
+        قاموس: مفتاح الموسم -> قائمة المباريات الصالحة
+
+    الاستثناءات:
+        FileNotFoundError: إذا لم يكن ملف المباريات موجوداً
+    """
+    log("جارٍ تحميل وتجميع بيانات المباريات...", "INFO")
+
+    # تحميل المباريات
+    matches_path = config.DATA_DIR / "matches.json"
+    all_matches = load_matches(matches_path)
+
+    # تصفية المباريات الصالحة
+    valid_matches = filter_valid_matches(all_matches)
+
+    if not valid_matches:
+        raise ValueError("لا توجد مباريات صالحة للتدريب بعد التصفية.")
+
+    # تجميع حسب الموسم
+    matches_by_season = group_matches_by_season(valid_matches)
+
+    return matches_by_season
+
+
+# -----------------------------------------------------------------------------
+# القسم الثالث: دوال التنبؤ باستخدام Dixon-Coles
+# -----------------------------------------------------------------------------
+
+def calculate_dc_score_matrix(
+    lambda_home: float,
+    lambda_away: float,
+    rho: float,
+    max_goals: int = MAX_GOALS
+) -> np.ndarray:
+    """
+    حساب مصفوفة احتمالات النتائج باستخدام نموذج Dixon-Coles.
+
+    المعاملات:
+        lambda_home: معدّل أهداف المضيف المتوقع
+        lambda_away: معدّل أهداف الضيف المتوقع
+        rho: معامل الارتباط (Dixon-Coles rho)
+        max_goals: الحد الأقصى لعدد الأهداف
+
+    العائد:
+        مصفوفة numpy ثنائية الأبعاد تمثّل احتمالات النتائج.
+        البعد الأول = أهداف المضيف، البعد الثاني = أهداف الضيف.
+    """
+    # التأكد من أن lambda قيم موجبة
+    lambda_home = max(lambda_home, 0.001)
+    lambda_away = max(lambda_away, 0.001)
+
+    # حساب توزيع بواسون لكل فريق
+    goals_range = np.arange(0, max_goals + 1)
+    home_goals_pmf = poisson.pmf(goals_range, lambda_home)
+    away_goals_pmf = poisson.pmf(goals_range, lambda_away)
+
+    # بناء مصفوفة الاحتمالات المستقلة
+    score_matrix = np.outer(home_goals_pmf, away_goals_pmf)
+
+    # تطبيق معامل الارتباط rho (Dixon-Coles adjustment)
+    # هذا يعدّل الاحتمالات للنتائج المنخفضة (0-0, 0-1, 1-0, 1-1)
+    if rho != 0.0:
+        tau = np.ones((max_goals + 1, max_goals + 1))
+
+        # تعديل Dixon-Coles للنتائج المنخفضة
+        tau[0, 0] = 1.0 - (lambda_home * lambda_away * rho)
+        tau[0, 1] = 1.0 + (lambda_home * rho)
+        tau[1, 0] = 1.0 + (lambda_away * rho)
+        tau[1, 1] = 1.0 - rho
+
+        # التأكد من عدم وجود قيم سالبة (حماية عددية)
+        # يمكن أن تحدث قيم سالبة إذا كان rho كبيراً جداً
+        tau = np.maximum(tau, 0.0)
+
+        score_matrix = score_matrix * tau
+
+    # التأكد من عدم وجود قيم سالبة في المصفوفة النهائية
+    score_matrix = np.maximum(score_matrix, 0.0)
+
+    return score_matrix
+
+
+def extract_probabilities_from_matrix(
+    score_matrix: np.ndarray
+) -> Tuple[float, float, float]:
+    """
+    استخراج احتمالات (فوز المضيف، تعادل، فوز الضيف) من مصفوفة النتائج.
+
+    المعاملات:
+        score_matrix: مصفوفة احتمالات النتائج
+
+    العائد:
+        tuple يحتوي على (prob_home_win, prob_draw, prob_away_win)
+        مجموعها يساوي 1.0 بالضبط بعد التطبيع.
+    """
+    # فوز المضيف: أهداف المضيف > أهداف الضيف (المثلث السفلي)
+    prob_home_win = float(np.sum(np.tril(score_matrix, -1)))
+
+    # تعادل: أهداف المضيف = أهداف الضيف (القطر)
+    prob_draw = float(np.sum(np.diag(score_matrix)))
+
+    # فوز الضيف: أهداف الضيف > أهداف المضيف (المثلث العلوي)
+    prob_away_win = float(np.sum(np.triu(score_matrix, 1)))
+
+    # تطبيع الاحتمالات لضمان مجموعها = 1.0
+    total_prob = prob_home_win + prob_draw + prob_away_win
+
+    if total_prob <= 0.0:
+        # حالة نادرة جداً: جميع الاحتمالات صفرية
+        return (1.0 / 3.0, 1.0 / 3.0, 1.0 / 3.0)
+
+    prob_home_win /= total_prob
+    prob_draw /= total_prob
+    prob_away_win /= total_prob
+
+    return (prob_home_win, prob_draw, prob_away_win)
+
+
+def predict_match_probabilities(
+    match: Dict,
+    factors_attack: Dict,
+    factors_defense: Dict,
+    league_avgs: Dict,
+    rho: float
+) -> Tuple[float, float, float]:
+    """
+    التنبؤ باحتمالات (فوز المضيف، تعادل، فوز الضيف) لمباراة واحدة
+    باستخدام نموذج Dixon-Coles.
+
+    المعاملات:
+        match: بيانات المباراة
+        factors_attack: عوامل الهجوم لكل فريق
+        factors_defense: عوامل الدفاع لكل فريق
+        league_avgs: متوسطات الدوري
+        rho: معامل الارتباط Dixon-Coles
+
+    العائد:
+        tuple يحتوي على (prob_home_win, prob_draw, prob_away_win)
+    """
+    # استخراج معرّفات الفرق — نحاول ID أولاً ثم الاسم
+    home_team_data = match.get("homeTeam", {})
+    away_team_data = match.get("awayTeam", {})
+
+    # نستخدم المعرّف (id) كمفتاح أساسي، وإن لم يوجد نستخدم الاسم
+    home_key = str(home_team_data.get("id", home_team_data.get("name", "unknown_home")))
+    away_key = str(away_team_data.get("id", away_team_data.get("name", "unknown_away")))
+
+    # استخراج متوسطات الدوري
+    avg_home_goals = league_avgs.get("avg_home_goals", 1.5)
+    avg_away_goals = league_avgs.get("avg_away_goals", 1.2)
+
+    # استخراج عوامل الفرق — القيمة الافتراضية 1.0 للفرق غير المعروفة
+    home_attack = factors_attack.get(home_key, 1.0)
+    away_defense = factors_defense.get(away_key, 1.0)
+    away_attack = factors_attack.get(away_key, 1.0)
+    home_defense = factors_defense.get(home_key, 1.0)
+
+    # حساب معدّلات الأهداف المتوقعة (λ)
+    lambda_home = home_attack * away_defense * avg_home_goals
+    lambda_away = away_attack * home_defense * avg_away_goals
+
+    # حساب مصفوفة الاحتمالات
+    score_matrix = calculate_dc_score_matrix(lambda_home, lambda_away, rho)
+
+    # استخراج الاحتمالات النهائية
+    probabilities = extract_probabilities_from_matrix(score_matrix)
+
+    return probabilities
+
+
+# -----------------------------------------------------------------------------
+# القسم الرابع: دوال التقييم (Log-Loss)
+# -----------------------------------------------------------------------------
+
+def get_actual_result_index(match: Dict) -> Optional[int]:
+    """
+    تحديد مؤشر النتيجة الفعلية للمباراة.
+
+    المعاملات:
+        match: بيانات المباراة
+
+    العائد:
+        0 لفوز المضيف، 1 للتعادل، 2 لفوز الضيف، أو None إذا غير محدد
+    """
+    winner = match.get("score", {}).get("winner")
+
+    if winner == "HOME_TEAM":
+        return 0
+    elif winner == "DRAW":
+        return 1
+    elif winner == "AWAY_TEAM":
+        return 2
+    else:
+        return None
+
+
+def calculate_logloss(
+    predictions: List[Tuple[float, float, float]],
+    validation_set: List[Dict]
+) -> float:
+    """
+    حساب Log-Loss لمجموعة من التنبؤات والنتائج الفعلية.
+
+    Log-Loss = -1/N * Σ log(p_actual)
+
+    حيث p_actual هو الاحتمال الذي أعطاه النموذج للنتيجة الفعلية.
+    القيمة الأقل تعني أداءً أفضل.
+
+    المعاملات:
+        predictions: قائمة التنبؤات (كل عنصر هو tuple من 3 احتمالات)
+        validation_set: قائمة المباريات الفعلية
+
+    العائد:
+        قيمة Log-Loss (الأقل أفضل)
+    """
+    if len(predictions) != len(validation_set):
+        log(
+            f"تحذير: عدد التنبؤات ({len(predictions)}) "
+            f"لا يطابق عدد المباريات ({len(validation_set)})",
+            "WARNING"
+        )
+        return DEFAULT_BAD_LOGLOSS
+
+    log_losses = []
+
+    for i, match in enumerate(validation_set):
+        # تحديد النتيجة الفعلية
+        result_index = get_actual_result_index(match)
+
+        if result_index is None:
+            # تجاهل المباريات بدون نتيجة محددة
+            continue
+
+        # استخراج الاحتمال الذي أعطاه النموذج للنتيجة الفعلية
+        probs = predictions[i]
+        prob_actual = probs[result_index]
+
+        # حساب log-loss مع حماية من log(0)
+        log_loss_value = np.log(max(prob_actual, LOG_EPSILON))
+        log_losses.append(log_loss_value)
+
+    if not log_losses:
+        # لا توجد مباريات صالحة للتقييم
+        return DEFAULT_BAD_LOGLOSS
+
+    # Log-Loss = -mean(log(p_actual))
+    return float(-np.mean(log_losses))
+
+
+# -----------------------------------------------------------------------------
+# القسم الخامس: البحث عن أفضل المعاملات (Hyperparameter Tuning)
+# -----------------------------------------------------------------------------
+
+def get_hyperparam_grid() -> Dict[str, List]:
+    """
+    الحصول على شبكة البحث عن المعاملات من الإعدادات.
+
+    العائد:
+        قاموس: اسم المعامل -> قائمة القيم الممكنة
+    """
+    grid = getattr(config, "HYPERPARAM_GRID", None)
+
+    if grid is None or not isinstance(grid, dict) or not grid:
+        # شبكة افتراضية في حالة عدم وجودها في الإعدادات
+        log("لم يتم العثور على HYPERPARAM_GRID في الإعدادات. استخدام القيم الافتراضية.", "WARNING")
+        grid = {
+            "TEAM_FACTORS_HALFLIFE_DAYS": [180],
+            "TEAM_FACTORS_PRIOR_GLOBAL": [0.5],
+            "TEAM_FACTORS_DAMPING": [0.05],
+            "TEAM_FACTORS_TEAM_PRIOR_WEIGHT": [0.3],
+            "DC_RHO_MAX": [0.15],
+        }
+
+    return grid
+
+
+def get_default_params() -> Dict:
+    """
+    الحصول على المعاملات الافتراضية (أول قيمة من كل معامل في الشبكة).
+
+    العائد:
+        قاموس المعاملات الافتراضية
+    """
+    grid = get_hyperparam_grid()
+    default_params = {}
+
+    for param_name, param_values in grid.items():
+        if param_values and len(param_values) > 0:
+            default_params[param_name] = param_values[0]
+        else:
+            log(f"تحذير: المعامل {param_name} لا يحتوي على قيم.", "WARNING")
+
+    return default_params
+
+
+def generate_param_combinations(grid: Dict[str, List]) -> List[Dict]:
+    """
+    توليد جميع التركيبات الممكنة من شبكة المعاملات.
+
+    المعاملات:
+        grid: شبكة المعاملات
+
+    العائد:
+        قائمة من القواميس، كل قاموس يمثّل تركيبة واحدة
+    """
+    if not grid:
+        return [{}]
+
+    keys = list(grid.keys())
+    values = list(grid.values())
+
+    combinations = [
+        dict(zip(keys, combo))
+        for combo in itertools.product(*values)
+    ]
+
+    return combinations
+
+
+def split_train_validation(
+    matches: List[Dict],
+    split_ratio: float = TRAIN_VALIDATION_SPLIT
+) -> Tuple[List[Dict], List[Dict]]:
+    """
+    تقسيم المباريات إلى مجموعتي تدريب وتحقق بناءً على الترتيب الزمني.
+    المباريات الأقدم للتدريب والأحدث للتحقق.
+
+    المعاملات:
+        matches: قائمة المباريات (يجب أن تكون مرتبة زمنياً)
+        split_ratio: نسبة التدريب (افتراضي 0.8)
+
+    العائد:
+        tuple يحتوي على (train_set, validation_set)
+    """
+    # ترتيب المباريات زمنياً
+    sorted_matches = sorted(
+        matches,
+        key=lambda m: m.get("utcDate", "")
+    )
+
+    # نقطة التقسيم
+    split_point = int(len(sorted_matches) * split_ratio)
+
+    train_set = sorted_matches[:split_point]
+    validation_set = sorted_matches[split_point:]
+
+    return train_set, validation_set
+
+
+def evaluate_params(
+    params: Dict,
+    train_set: List[Dict],
+    validation_set: List[Dict],
+    end_date_train: Optional[datetime],
+    prev_factors: Dict
+) -> float:
+    """
+    تقييم مجموعة معاملات واحدة عبر التدريب على مجموعة التدريب
+    والتقييم على مجموعة التحقق.
+
+    المعاملات:
+        params: المعاملات المراد تقييمها
+        train_set: مجموعة التدريب
+        validation_set: مجموعة التحقق
+        end_date_train: تاريخ نهاية مجموعة التدريب
+        prev_factors: عوامل الموسم السابق (للبراير الهرمي)
+
+    العائد:
+        قيمة Log-Loss (الأقل أفضل)
+    """
+    try:
+        # 1. تدريب نموذج مؤقت على مجموعة التدريب فقط
+        league_avgs_train = calculate_league_averages(train_set)
+
+        factors_attack_train, factors_defense_train = build_team_factors(
+            train_set,
+            league_avgs_train,
+            end_date_train,
+            decay_halflife_days=params.get("TEAM_FACTORS_HALFLIFE_DAYS", 180),
+            prior_strength=params.get("TEAM_FACTORS_PRIOR_GLOBAL", 0.5),
+            damping=params.get("TEAM_FACTORS_DAMPING", 0.05),
+            prior_attack=prev_factors.get("attack"),
+            prior_defense=prev_factors.get("defense"),
+            team_prior_weight=params.get("TEAM_FACTORS_TEAM_PRIOR_WEIGHT", 0.3),
+        )
+
+        temp_rho = fit_dc_rho_mle(
+            train_set,
+            factors_attack_train,
+            factors_defense_train,
+            league_avgs_train,
+            decay_halflife_days=params.get("TEAM_FACTORS_HALFLIFE_DAYS", 180),
+            rho_max=params.get("DC_RHO_MAX", 0.15),
+        )
+
+        # 2. التنبؤ بنتائج مجموعة التحقق
+        predictions = []
+        for match in validation_set:
+            probs = predict_match_probabilities(
+                match,
+                factors_attack_train,
+                factors_defense_train,
+                league_avgs_train,
+                temp_rho
+            )
+            predictions.append(probs)
+
+        # 3. حساب Log-Loss
+        score = calculate_logloss(predictions, validation_set)
+
+        return score
+
+    except Exception as e:
+        log(f"  خطأ أثناء تقييم المعاملات: {e}", "WARNING")
+        return DEFAULT_BAD_LOGLOSS
+
+
+def find_best_params_for_season(
+    matches: List[Dict],
+    prev_factors: Dict,
+    season_key: str = ""
+) -> Tuple[Dict, float]:
+    """
+    البحث عن أفضل مجموعة معاملات لموسم معين باستخدام تقييم Log-Loss حقيقي
+    على مجموعة تحقق منفصلة.
+
+    المعاملات:
+        matches: جميع مباريات الموسم
+        prev_factors: عوامل الموسم السابق (للبراير الهرمي)
+        season_key: مفتاح الموسم (للتسجيل)
+
+    العائد:
+        tuple يحتوي على (أفضل المعاملات, أفضل قيمة Log-Loss)
+    """
+    log(f"بدء البحث عن أفضل المعاملات لـ {season_key}...", "INFO")
+
+    # تقسيم البيانات إلى تدريب وتحقق
+    train_set, validation_set = split_train_validation(matches)
+
+    log(f"  مجموعة التدريب: {len(train_set)} مباراة", "INFO")
+    log(f"  مجموعة التحقق: {len(validation_set)} مباراة", "INFO")
+
+    # التحقق من كفاية مجموعة التحقق
+    if len(validation_set) < MIN_VALIDATION_SET_SIZE:
+        log(
+            f"  مجموعة التحقق صغيرة جداً ({len(validation_set)} مباراة). "
+            f"سيتم استخدام المعاملات الافتراضية.",
+            "WARNING"
+        )
+        default_params = get_default_params()
+        return default_params, DEFAULT_BAD_LOGLOSS
+
+    # التحقق من كفاية مجموعة التدريب
+    if len(train_set) < MIN_VALIDATION_SET_SIZE:
+        log(
+            f"  مجموعة التدريب صغيرة جداً ({len(train_set)} مباراة). "
+            f"سيتم استخدام المعاملات الافتراضية.",
+            "WARNING"
+        )
+        default_params = get_default_params()
+        return default_params, DEFAULT_BAD_LOGLOSS
+
+    # تحديد تاريخ نهاية مجموعة التدريب
+    train_dates = []
+    for m in train_set:
+        dt = parse_date_safe(m.get("utcDate"))
+        if dt is not None:
+            train_dates.append(dt)
+
+    if train_dates:
+        end_date_train = max(train_dates)
+    else:
+        log("  لم يتم العثور على تواريخ صالحة في مجموعة التدريب.", "WARNING")
+        default_params = get_default_params()
+        return default_params, DEFAULT_BAD_LOGLOSS
+
+    # توليد جميع تركيبات المعاملات
+    grid = get_hyperparam_grid()
+    param_combinations = generate_param_combinations(grid)
+
+    total_combinations = len(param_combinations)
+    log(f"  عدد التركيبات المطلوب تقييمها: {total_combinations}", "INFO")
+
+    # البحث الشامل (Grid Search)
+    best_params = None
+    best_score = float("inf")
+
+    for idx, params in enumerate(param_combinations, 1):
+        # تقييم هذه التركيبة
+        score = evaluate_params(
+            params, train_set, validation_set,
+            end_date_train, prev_factors
+        )
+
+        # تسجيل التقدم (كل 10 تركيبات أو آخر تركيبة)
+        if idx % 10 == 0 or idx == total_combinations or idx == 1:
+            log(
+                f"  [{idx}/{total_combinations}] Log-Loss = {score:.4f}",
+                "DEBUG"
+            )
+
+        # تحديث أفضل النتائج
+        if score < best_score:
+            best_score = score
+            best_params = params.copy()
+
+    # التحقق من وجود نتيجة
+    if best_params is None:
+        log("  لم يتم العثور على معاملات مناسبة. استخدام القيم الافتراضية.", "WARNING")
+        best_params = get_default_params()
+
+    log(
+        f"  أفضل المعاملات لـ {season_key}: "
+        f"Log-Loss = {best_score:.4f}",
+        "INFO"
+    )
+    for param_name, param_value in best_params.items():
+        log(f"    {param_name}: {param_value}", "INFO")
+
+    return best_params, best_score
+
+
+# -----------------------------------------------------------------------------
+# القسم السادس: دوال التدريب الرئيسية
+# -----------------------------------------------------------------------------
+
+def parse_season_key(key: str) -> Tuple[str, int]:
     """
     تحليل مفتاح الموسم إلى رمز المسابقة وسنة البداية.
 
     المعاملات:
-        sk: مفتاح الموسم (مثلاً "PL_2024")
+        key: مفتاح الموسم (مثلاً "PL_2024")
 
     العائد:
         tuple يحتوي على (رمز المسابقة, سنة البداية)
     """
     try:
-        parts = sk.rsplit("_", 1)
+        parts = key.rsplit("_", 1)
         if len(parts) == 2:
-            comp = parts[0]
-            yr = int(parts[1])
-            return comp, yr
+            comp_code = parts[0]
+            year = int(parts[1])
+            return comp_code, year
     except (ValueError, IndexError):
         pass
 
-    return sk, 0
-
-
-# -----------------------------------------------------------------------------
-# القسم الثاني: أدوات تحليل سطر الأوامر
-# -----------------------------------------------------------------------------
-
-def parse_grid_list_floats(s: str) -> List[float]:
-    """
-    تحليل سلسلة نصية مفصولة بفواصل إلى قائمة أرقام عشرية.
-
-    المعاملات:
-        s: السلسلة النصية (مثلاً "2.0,3.0,5.0")
-
-    العائد:
-        قائمة أرقام عشرية
-    """
-    result = []
-    for x in s.split(","):
-        x = x.strip()
-        if x:
-            try:
-                result.append(float(x))
-            except ValueError:
-                log(f"تحذير: قيمة غير صالحة في الشبكة: '{x}'", "WARNING")
-    return result
-
-
-def parse_grid_list_ints(s: str) -> List[int]:
-    """
-    تحليل سلسلة نصية مفصولة بفواصل إلى قائمة أعداد صحيحة.
-
-    المعاملات:
-        s: السلسلة النصية (مثلاً "90,180,365")
-
-    العائد:
-        قائمة أعداد صحيحة
-    """
-    result = []
-    for x in s.split(","):
-        x = x.strip()
-        if x:
-            try:
-                result.append(int(x))
-            except ValueError:
-                log(f"تحذير: قيمة غير صالحة في الشبكة: '{x}'", "WARNING")
-    return result
-
-
-# -----------------------------------------------------------------------------
-# القسم الثالث: تحديد نتيجة المباراة
-# -----------------------------------------------------------------------------
-
-def outcome_label(home_goals: int, away_goals: int) -> int:
-    """
-    تحديد تصنيف نتيجة المباراة بناءً على الأهداف.
-
-    المعاملات:
-        home_goals: أهداف المضيف
-        away_goals: أهداف الضيف
-
-    العائد:
-        0 = فوز المضيف، 1 = تعادل، 2 = فوز الضيف
-    """
-    if home_goals > away_goals:
-        return 0  # فوز المضيف
-    elif home_goals == away_goals:
-        return 1  # تعادل
-    else:
-        return 2  # فوز الضيف
-
-
-# -----------------------------------------------------------------------------
-# القسم الرابع: حساب مقاييس التقييم
-# -----------------------------------------------------------------------------
-
-def compute_metrics(
-    probs: List[Tuple[float, float, float]],
-    labels: List[int],
-    ece_bins: int = DEFAULT_ECE_BINS
-) -> Dict[str, Any]:
-    """
-    حساب مقاييس أداء النموذج: LogLoss, Brier Score, Accuracy, ECE.
-
-    المعاملات:
-        probs: قائمة التنبؤات (كل عنصر هو tuple من 3 احتمالات:
-               فوز المضيف، تعادل، فوز الضيف)
-        labels: قائمة التصنيفات الفعلية
-               (0 = فوز المضيف، 1 = تعادل، 2 = فوز الضيف)
-        ece_bins: عدد صناديق ECE
-
-    العائد:
-        قاموس يحتوي على المقاييس: n, logloss, brier, accuracy, ece
-    """
-    n = len(labels)
-
-    if n == 0:
-        return {
-            "n": 0,
-            "logloss": None,
-            "brier": None,
-            "accuracy": None,
-            "ece": None,
-        }
-
-    if len(probs) != n:
-        log(
-            f"تحذير: عدد التنبؤات ({len(probs)}) لا يطابق عدد الملصقات ({n})",
-            "WARNING"
-        )
-        n = min(len(probs), n)
-
-    # متراكمات
-    logloss_sum = 0.0
-    brier_sum = 0.0
-    correct = 0
-
-    # صناديق ECE
-    num_bins = max(1, ece_bins)
-    bins: List[List[Tuple[bool, float]]] = [[] for _ in range(num_bins)]
-
-    for i in range(n):
-        prob_tuple = probs[i]
-        y = labels[i]
-
-        # استخراج الاحتمالات وضمان أنها موجبة
-        ph = max(LOG_EPSILON, float(prob_tuple[0]))
-        pd = max(LOG_EPSILON, float(prob_tuple[1]))
-        pa = max(LOG_EPSILON, float(prob_tuple[2]))
-
-        # تطبيع الاحتمالات
-        p_arr = np.array([ph, pd, pa], dtype=np.float64)
-        p_sum = p_arr.sum()
-        if p_sum > 0:
-            p_arr = p_arr / p_sum
-        else:
-            p_arr = np.array([1.0 / 3.0, 1.0 / 3.0, 1.0 / 3.0])
-
-        # --- LogLoss ---
-        # LogLoss = -log(p_actual)
-        logloss_sum += -math.log(max(float(p_arr[y]), LOG_EPSILON))
-
-        # --- Brier Score (multi-class) ---
-        # Brier = sum((p_i - y_i)^2) حيث y_i = 1 للفئة الصحيحة و0 لغيرها
-        y_vec = np.zeros(3, dtype=np.float64)
-        y_vec[y] = 1.0
-        brier_sum += float(np.sum((p_arr - y_vec) ** 2))
-
-        # --- Accuracy ---
-        pred = int(np.argmax(p_arr))
-        if pred == y:
-            correct += 1
-
-        # --- ECE ---
-        # نستخدم أعلى ثقة (top-class confidence) لتحديد الصندوق
-        conf = float(np.max(p_arr))
-        bin_idx = min(num_bins - 1, int(conf * num_bins))
-        is_correct = (pred == y)
-        bins[bin_idx].append((is_correct, conf))
-
-    # حساب ECE (Expected Calibration Error)
-    ece_sum = 0.0
-    for b in bins:
-        if not b:
-            continue
-        # دقة الصندوق (accuracy)
-        acc_bin = sum(1.0 if item[0] else 0.0 for item in b) / len(b)
-        # متوسط الثقة في الصندوق
-        conf_bin = sum(item[1] for item in b) / len(b)
-        # مساهمة الصندوق في ECE (مرجّحة بحجم الصندوق)
-        ece_sum += abs(acc_bin - conf_bin) * (len(b) / n)
-
-    return {
-        "n": n,
-        "logloss": logloss_sum / n,
-        "brier": brier_sum / n,
-        "accuracy": correct / n,
-        "ece": ece_sum,
-    }
-
-
-# -----------------------------------------------------------------------------
-# القسم الخامس: حساب λ والتنبؤ بالاحتمالات
-# -----------------------------------------------------------------------------
-
-def compute_lambdas_for_match(
-    match: Dict[str, Any],
-    factors_attack: Dict[str, float],
-    factors_defense: Dict[str, float],
-    league_avgs: Dict[str, Any],
-) -> Tuple[float, float]:
-    """
-    حساب معدّلات الأهداف المتوقعة (λ) لمباراة باستخدام نموذج Dixon-Coles.
-
-    λ_home = avg_home_goals * A_home * D_away
-    λ_away = avg_away_goals * A_away * D_home
-
-    المعاملات:
-        match: بيانات المباراة
-        factors_attack: عوامل الهجوم لكل فريق (مفتاح = ID الفريق كنص)
-        factors_defense: عوامل الدفاع لكل فريق (مفتاح = ID الفريق كنص)
-        league_avgs: متوسطات الدوري
-
-    العائد:
-        tuple يحتوي على (lambda_home, lambda_away)
-    """
-    # استخراج معرّفات الفريقين
-    home_id = str(match.get("homeTeam", {}).get("id", "unknown"))
-    away_id = str(match.get("awayTeam", {}).get("id", "unknown"))
-
-    # استخراج متوسطات الدوري
-    avg_home_goals = float(league_avgs.get("avg_home_goals", 1.40))
-    avg_away_goals = float(league_avgs.get("avg_away_goals", 1.10))
-
-    # استخراج عوامل الهجوم والدفاع
-    attack_home = float(factors_attack.get(home_id, 1.0))
-    defense_home = float(factors_defense.get(home_id, 1.0))
-    attack_away = float(factors_attack.get(away_id, 1.0))
-    defense_away = float(factors_defense.get(away_id, 1.0))
-
-    # حساب λ
-    # λ_home = متوسط أهداف المضيف × هجوم المضيف × دفاع الضيف
-    lambda_home = avg_home_goals * attack_home * defense_away
-
-    # λ_away = متوسط أهداف الضيف × هجوم الضيف × دفاع المضيف
-    lambda_away = avg_away_goals * attack_away * defense_home
-
-    # ضمان قيم موجبة
-    lambda_home = max(lambda_home, 1e-6)
-    lambda_away = max(lambda_away, 1e-6)
-
-    return lambda_home, lambda_away
-
-
-def adjust_lambdas_with_elo(
-    lambda_home: float,
-    lambda_away: float,
-    elo_home: float,
-    elo_away: float
-) -> Tuple[float, float]:
-    """
-    تعديل معدّلات الأهداف (λ) باستخدام فرق تقييمات ELO.
-
-    يضيف عامل أفضلية الأرض (HFA) ثم يحسب عامل التعديل بناءً على
-    الفرق في ELO.
-
-    المعاملات:
-        lambda_home: معدّل أهداف المضيف الأصلي
-        lambda_away: معدّل أهداف الضيف الأصلي
-        elo_home: تقييم ELO للمضيف
-        elo_away: تقييم ELO للضيف
-
-    العائد:
-        tuple يحتوي على (lambda_home_adjusted, lambda_away_adjusted)
-    """
-    # استخراج إعدادات ELO من config
-    elo_hfa = float(getattr(config, "ELO_HFA", 60.0))
-    elo_lambda_scale = float(getattr(config, "ELO_LAMBDA_SCALE", 400.0))
-
-    # حساب الأفضلية الإجمالية (فرق ELO + أفضلية الأرض)
-    edge = (float(elo_home) - float(elo_away)) + elo_hfa
-
-    # حساب عامل التعديل
-    # factor > 1 يعني المضيف أقوى، factor < 1 يعني الضيف أقوى
-    factor = 10.0 ** (edge / elo_lambda_scale)
-
-    # تعديل λ
-    adjusted_home = lambda_home * factor
-    adjusted_away = max(1e-6, lambda_away / factor)
-
-    return adjusted_home, adjusted_away
-
-
-def predict_probs_for_match(
-    match: Dict[str, Any],
-    models: Dict[str, Any],
-    use_elo: bool = True
-) -> Tuple[float, float, float]:
-    """
-    التنبؤ باحتمالات (فوز المضيف، تعادل، فوز الضيف) لمباراة واحدة.
-
-    يستخدم نموذج Dixon-Coles مع إمكانية تعديل بواسطة ELO.
-
-    ملاحظة مهمة حول اتجاه المصفوفة:
-    - mat[i, j] = P(أهداف المضيف = i، أهداف الضيف = j)
-    - فوز المضيف: i > j → المثلث السفلي (tril مع k=-1)
-    - تعادل: i = j → القطر (trace)
-    - فوز الضيف: j > i → المثلث العلوي (triu مع k=1)
-
-    المعاملات:
-        match: بيانات المباراة
-        models: قاموس يحتوي على مكونات النموذج
-        use_elo: تفعيل تعديل ELO
-
-    العائد:
-        tuple يحتوي على (prob_home_win, prob_draw, prob_away_win)
-    """
-    # استخراج مكونات النموذج
-    factors_attack = models.get("factors_A", {})
-    factors_defense = models.get("factors_D", {})
-    league_avgs = models.get("league_avgs", {})
-    rho = float(models.get("rho", 0.0))
-    elo_ratings = models.get("elo", {})
-
-    # حساب λ الأساسي
-    lambda_home, lambda_away = compute_lambdas_for_match(
-        match, factors_attack, factors_defense, league_avgs
+    log(
+        f"فشل في تحليل مفتاح الموسم '{key}'. "
+        f"سيتم استخدام ترتيب افتراضي.",
+        "WARNING"
     )
-
-    # تعديل بواسطة ELO إذا مطلوب
-    if use_elo and elo_ratings:
-        home_id = str(match.get("homeTeam", {}).get("id", "unknown"))
-        away_id = str(match.get("awayTeam", {}).get("id", "unknown"))
-
-        elo_start = float(getattr(config, "ELO_START", 1500.0))
-        elo_home = float(elo_ratings.get(home_id, elo_start))
-        elo_away = float(elo_ratings.get(away_id, elo_start))
-
-        lambda_home, lambda_away = adjust_lambdas_with_elo(
-            lambda_home, lambda_away, elo_home, elo_away
-        )
-
-    # حساب الحد الأقصى للأهداف
-    goal_cutoff = suggest_goal_cutoff(lambda_home, lambda_away)
-
-    # حساب مصفوفة الاحتمالات (Dixon-Coles)
-    mat = poisson_matrix_dc(lambda_home, lambda_away, rho, max_goals=goal_cutoff)
-
-    # استخراج الاحتمالات الثلاثة
-    # mat[i, j] = P(home=i, away=j)
-    # فوز المضيف: أهداف المضيف > أهداف الضيف → المثلث السفلي
-    prob_home_win = float(np.tril(mat, k=-1).sum())
-
-    # تعادل: أهداف المضيف = أهداف الضيف → القطر
-    prob_draw = float(np.trace(mat))
-
-    # فوز الضيف: أهداف الضيف > أهداف المضيف → المثلث العلوي
-    prob_away_win = float(np.triu(mat, k=1).sum())
-
-    # تطبيع الاحتمالات
-    total = prob_home_win + prob_draw + prob_away_win
-    if total > 0:
-        prob_home_win /= total
-        prob_draw /= total
-        prob_away_win /= total
-    else:
-        # حالة نادرة جداً
-        prob_home_win = 1.0 / 3.0
-        prob_draw = 1.0 / 3.0
-        prob_away_win = 1.0 / 3.0
-
-    return prob_home_win, prob_draw, prob_away_win
+    return key, 0
 
 
-# -----------------------------------------------------------------------------
-# القسم السادس: تدريب النماذج لنافذة زمنية
-# -----------------------------------------------------------------------------
-
-def get_end_date_from_matches(matches: List[Dict]) -> Optional[datetime]:
+def get_season_end_date(matches: List[Dict]) -> Optional[datetime]:
     """
-    استخراج تاريخ آخر مباراة من قائمة مباريات.
+    تحديد تاريخ نهاية الموسم (آخر مباراة).
 
     المعاملات:
-        matches: قائمة المباريات
+        matches: قائمة مباريات الموسم
 
     العائد:
-        تاريخ آخر مباراة، أو None
+        تاريخ آخر مباراة، أو None إذا لم تكن هناك تواريخ صالحة
     """
     dates = []
     for m in matches:
@@ -611,615 +874,252 @@ def get_end_date_from_matches(matches: List[Dict]) -> Optional[datetime]:
     return None
 
 
-def train_models_for_window(
-    train_matches: List[Dict[str, Any]],
-    halflife_days: int,
-    prior_global: float,
-    team_prior_weight: float,
-    rho_max: float,
-    rho_step: float,
-    damping: float = 0.5,
-    prev_season_prior: Optional[Dict[str, Dict[str, float]]] = None,
-) -> Optional[Dict[str, Any]]:
-    """
-    تدريب مجموعة كاملة من النماذج على نافذة تدريب معيّنة.
-
-    المعاملات:
-        train_matches: مباريات التدريب (مرتبة زمنياً)
-        halflife_days: نصف عمر الانحلال الزمني بالأيام
-        prior_global: قوة الانكماش نحو 1.0 (Gamma prior)
-        team_prior_weight: وزن الانكماش الهرمي نحو الموسم السابق
-        rho_max: الحد الأقصى لقيمة |rho|
-        rho_step: دقة شبكة البحث عن rho
-        damping: معامل التخميد لعوامل الفرق
-        prev_season_prior: عوامل الموسم السابق (للبراير الهرمي)
-
-    العائد:
-        قاموس يحتوي على مكونات النموذج، أو None في حالة الفشل
-    """
-    if not train_matches:
-        return None
-
-    try:
-        # تحديد تاريخ نهاية نافذة التدريب
-        season_end_date = get_end_date_from_matches(train_matches)
-
-        # حساب متوسطات الدوري
-        league_avgs = calculate_league_averages(train_matches)
-
-        # استخراج عوامل الموسم السابق (إن وُجدت)
-        prior_attack = None
-        prior_defense = None
-        if prev_season_prior:
-            prior_attack = prev_season_prior.get("attack")
-            prior_defense = prev_season_prior.get("defense")
-
-        # بناء عوامل الفرق
-        factors_attack, factors_defense = build_team_factors(
-            train_matches,
-            league_avgs,
-            season_end_date,
-            decay_halflife_days=halflife_days,
-            prior_strength=prior_global,
-            damping=damping,
-            prior_attack=prior_attack,
-            prior_defense=prior_defense,
-            team_prior_weight=team_prior_weight,
-        )
-
-        # بناء تقييمات ELO
-        elo_start = float(getattr(config, "ELO_START", 1500.0))
-        elo_k_base = float(getattr(config, "ELO_K_BASE", 24.0))
-        elo_hfa = float(getattr(config, "ELO_HFA", 60.0))
-        elo_scale = float(getattr(config, "ELO_SCALE", 400.0))
-        elo_halflife = int(getattr(config, "ELO_HALFLIFE_DAYS", 365))
-
-        elo_ratings = build_elo_ratings(
-            train_matches,
-            start_rating=elo_start,
-            k_base=elo_k_base,
-            hfa_elo=elo_hfa,
-            scale=elo_scale,
-            decay_halflife_days=elo_halflife,
-        )
-
-        # حساب معامل الارتباط (rho)
-        rho = fit_dc_rho_mle(
-            train_matches,
-            factors_attack,
-            factors_defense,
-            league_avgs,
-            decay_halflife_days=halflife_days,
-            rho_min=-abs(rho_max),
-            rho_max=abs(rho_max),
-            rho_step=rho_step,
-        )
-
-        return {
-            "league_avgs": league_avgs,
-            "factors_A": factors_attack,
-            "factors_D": factors_defense,
-            "elo": elo_ratings,
-            "rho": rho,
-        }
-
-    except Exception as e:
-        log(f"خطأ أثناء تدريب نماذج النافذة: {e}", "WARNING")
-        return None
-
-
-def train_prior_for_next_season(
-    matches: List[Dict[str, Any]],
-    halflife_days: int,
-    prior_global: float,
-    damping: float = 0.5,
-) -> Dict[str, Dict[str, float]]:
-    """
-    تدريب عوامل كاملة لموسم لاستخدامها كبراير للموسم التالي.
-
-    يتم التدريب بدون استخدام براير من موسم سابق (team_prior_weight=0.0)
-    للحصول على عوامل مستقلة تماماً لهذا الموسم.
-
-    المعاملات:
-        matches: جميع مباريات الموسم
-        halflife_days: نصف عمر الانحلال الزمني
-        prior_global: قوة الانكماش نحو 1.0
-        damping: معامل التخميد
-
-    العائد:
-        قاموس يحتوي على {"attack": {...}, "defense": {...}}
-    """
-    try:
-        season_end_date = get_end_date_from_matches(matches)
-        league_avgs = calculate_league_averages(matches)
-
-        factors_attack, factors_defense = build_team_factors(
-            matches,
-            league_avgs,
-            season_end_date,
-            decay_halflife_days=halflife_days,
-            prior_strength=prior_global,
-            damping=damping,
-            prior_attack=None,
-            prior_defense=None,
-            team_prior_weight=0.0,
-        )
-
-        return {
-            "attack": factors_attack,
-            "defense": factors_defense,
-        }
-
-    except Exception as e:
-        log(f"فشل حساب براير الموسم: {e}", "WARNING")
-        return {}
-
-
-# -----------------------------------------------------------------------------
-# القسم السابع: منطق الباكتيست (Expanding Window)
-# -----------------------------------------------------------------------------
-
-def backtest_season_expanding(
+def train_season_model(
     season_key: str,
-    matches: List[Dict[str, Any]],
-    halflife_days: int,
-    prior_global: float,
-    team_prior_weight: float,
-    rho_max: float,
-    rho_step: float,
-    min_train: int,
-    block_size: int,
-    use_elo: bool,
-    prev_season_prior: Optional[Dict[str, Dict[str, float]]] = None,
-    ece_bins: int = DEFAULT_ECE_BINS,
+    matches: List[Dict],
+    best_params: Dict,
+    prev_factors: Dict
 ) -> Dict[str, Any]:
     """
-    تنفيذ باكتيست بنافذة متوسعة (expanding window) على موسم واحد.
-
-    الخوارزمية:
-    1. نبدأ بنافذة تدريب بحجم min_train
-    2. ندرّب النموذج على نافذة التدريب
-    3. نتنبأ بنتائج الكتلة التالية (block_size)
-    4. نوسّع النافذة لتشمل الكتلة المختبرة
-    5. نكرر حتى نفاد المباريات
+    تدريب النموذج النهائي لموسم واحد على كامل بيانات الموسم
+    باستخدام أفضل المعاملات.
 
     المعاملات:
-        season_key: مفتاح الموسم (للتسجيل)
-        matches: جميع مباريات الموسم (مرتبة زمنياً)
-        halflife_days: نصف عمر الانحلال
-        prior_global: قوة الانكماش العام
-        team_prior_weight: وزن البراير الهرمي
-        rho_max: الحد الأقصى لقيمة |rho|
-        rho_step: دقة شبكة rho
-        min_train: الحد الأدنى لعدد مباريات التدريب
-        block_size: حجم كتلة الاختبار
-        use_elo: تفعيل ELO
-        prev_season_prior: عوامل الموسم السابق
-        ece_bins: عدد صناديق ECE
+        season_key: مفتاح الموسم
+        matches: جميع مباريات الموسم
+        best_params: أفضل المعاملات (من البحث أو الافتراضية)
+        prev_factors: عوامل الموسم السابق (للبراير الهرمي)
 
     العائد:
-        قاموس يحتوي على:
-        - season_key: مفتاح الموسم
-        - n: عدد التنبؤات
-        - metrics: مقاييس الأداء
-        - all_probs: جميع الاحتمالات (لتجميع شامل لاحقاً)
-        - all_labels: جميع الملصقات
+        قاموس يحتوي على جميع مكونات النموذج المدرب:
+        - league_averages
+        - attack_factors
+        - defense_factors
+        - elo_ratings
+        - rho
+        - best_params
+        - metadata
     """
-    n_total = len(matches)
+    log(f"جارٍ تدريب النموذج النهائي لـ {season_key}...", "INFO")
 
-    # التحقق من كفاية المباريات
-    min_required = max(DEFAULT_MIN_SEASON_MATCHES, min_train + 5)
-    if n_total < min_required:
-        log(
-            f"  {season_key}: عدد المباريات ({n_total}) "
-            f"أقل من الحد الأدنى ({min_required}). تم التخطي.",
-            "WARNING"
-        )
-        return {
-            "season_key": season_key,
-            "n": 0,
-            "metrics": {},
-            "all_probs": [],
-            "all_labels": [],
-        }
+    # تحديد تاريخ نهاية الموسم
+    season_end_date = get_season_end_date(matches)
+    if season_end_date is None:
+        raise ValueError(f"لم يتم العثور على تواريخ صالحة في مباريات {season_key}")
 
-    # تجميع التنبؤات والملصقات
-    season_probs: List[Tuple[float, float, float]] = []
-    season_labels: List[int] = []
+    log(f"  تاريخ نهاية الموسم: {season_end_date}", "DEBUG")
 
-    # بدء النافذة المتوسعة
-    train_end = min_train
-    window_count = 0
-
-    while train_end < n_total:
-        # تحديد حدود كتلة الاختبار
-        test_start = train_end
-        test_end = min(n_total, train_end + block_size)
-
-        # استخراج مجموعتي التدريب والاختبار
-        train_subset = matches[:train_end]
-        test_subset = matches[test_start:test_end]
-
-        if not test_subset:
-            break
-
-        window_count += 1
-
-        # تدريب النماذج على نافذة التدريب
-        models = train_models_for_window(
-            train_subset,
-            halflife_days=halflife_days,
-            prior_global=prior_global,
-            team_prior_weight=team_prior_weight,
-            rho_max=rho_max,
-            rho_step=rho_step,
-            prev_season_prior=prev_season_prior,
-        )
-
-        if models is None:
-            # فشل التدريب — ننتقل لتوسيع النافذة
-            train_end = test_end
-            continue
-
-        # التنبؤ بنتائج كتلة الاختبار
-        for m in test_subset:
-            # استخراج النتيجة الفعلية
-            home_goals, away_goals = parse_score(m)
-            if home_goals is None or away_goals is None:
-                continue
-
-            # التنبؤ
-            try:
-                probs = predict_probs_for_match(m, models, use_elo=use_elo)
-
-                # التحقق من صحة الاحتمالات
-                if any(math.isnan(p) or math.isinf(p) for p in probs):
-                    continue
-
-                label = outcome_label(home_goals, away_goals)
-
-                season_probs.append(probs)
-                season_labels.append(label)
-
-            except Exception:
-                # تخطي المباريات التي تفشل في التنبؤ
-                continue
-
-        # توسيع النافذة
-        train_end = test_end
-
-    # حساب المقاييس
-    metrics = compute_metrics(season_probs, season_labels, ece_bins=ece_bins)
-
+    # 1. حساب متوسطات الدوري
+    league_avgs = calculate_league_averages(matches)
     log(
-        f"  {season_key}: "
-        f"N={metrics['n']}, "
-        f"نوافذ={window_count}, "
-        f"LogLoss={metrics.get('logloss', 'N/A')}, "
-        f"Acc={metrics.get('accuracy', 'N/A')}",
-        "DEBUG"
+        f"  متوسطات الدوري: "
+        f"أهداف المضيف = {league_avgs.get('avg_home_goals', 'N/A'):.3f}, "
+        f"أهداف الضيف = {league_avgs.get('avg_away_goals', 'N/A'):.3f}",
+        "INFO"
     )
+
+    # 2. بناء عوامل الفرق
+    factors_attack, factors_defense = build_team_factors(
+        matches,
+        league_avgs,
+        season_end_date,
+        decay_halflife_days=best_params.get("TEAM_FACTORS_HALFLIFE_DAYS", 180),
+        prior_strength=best_params.get("TEAM_FACTORS_PRIOR_GLOBAL", 0.5),
+        damping=best_params.get("TEAM_FACTORS_DAMPING", 0.05),
+        prior_attack=prev_factors.get("attack"),
+        prior_defense=prev_factors.get("defense"),
+        team_prior_weight=best_params.get("TEAM_FACTORS_TEAM_PRIOR_WEIGHT", 0.3),
+    )
+    log(f"  عدد الفرق بعوامل هجومية: {len(factors_attack)}", "INFO")
+    log(f"  عدد الفرق بعوامل دفاعية: {len(factors_defense)}", "INFO")
+
+    # 3. بناء تقييمات ELO
+    elo_k_base = getattr(config, "ELO_K_BASE", 20)
+    elo_hfa = getattr(config, "ELO_HFA", 50)
+
+    elo_ratings = build_elo_ratings(
+        matches,
+        k_base=elo_k_base,
+        hfa_elo=elo_hfa
+    )
+    log(f"  عدد الفرق بتقييم ELO: {len(elo_ratings)}", "INFO")
+
+    # 4. حساب معامل الارتباط (rho)
+    rho = fit_dc_rho_mle(
+        matches,
+        factors_attack,
+        factors_defense,
+        league_avgs,
+        decay_halflife_days=best_params.get("TEAM_FACTORS_HALFLIFE_DAYS", 180),
+        rho_max=best_params.get("DC_RHO_MAX", 0.15),
+    )
+    log(f"  معامل الارتباط (rho): {rho:.6f}", "INFO")
+
+    # 5. بيانات وصفية
+    metadata = {
+        "season_key": season_key,
+        "num_matches": len(matches),
+        "season_end_date": season_end_date.isoformat() if season_end_date else None,
+        "num_teams_attack": len(factors_attack),
+        "num_teams_defense": len(factors_defense),
+        "num_teams_elo": len(elo_ratings),
+        "trained_at": datetime.now(timezone.utc).isoformat(),
+    }
 
     return {
-        "season_key": season_key,
-        "n": metrics["n"],
-        "metrics": metrics,
-        "all_probs": season_probs,
-        "all_labels": season_labels,
+        "league_averages": league_avgs,
+        "attack_factors": factors_attack,
+        "defense_factors": factors_defense,
+        "elo_ratings": elo_ratings,
+        "rho": rho,
+        "best_params": best_params,
+        "metadata": metadata,
     }
 
 
-# -----------------------------------------------------------------------------
-# القسم الثامن: تشغيل الشبكة (Grid Search) وتجميع النتائج
-# -----------------------------------------------------------------------------
-
-def generate_param_combinations(
-    grid_halflife: List[int],
-    grid_prior_global: List[float],
-    grid_team_prior_w: List[float],
-    grid_rho_max: List[float],
-    rho_step: float,
-) -> List[Dict[str, Any]]:
+def train_all_models(
+    matches_by_season: Dict[str, List[Dict]],
+    skip_tuning: bool = False,
+    min_matches: int = DEFAULT_MIN_MATCHES_PER_SEASON
+) -> Dict[str, Dict[str, Any]]:
     """
-    توليد جميع تركيبات المعاملات من الشبكة.
+    المنسق الرئيسي: يدير عملية التدريب الكاملة لكل المواسم.
 
     المعاملات:
-        grid_halflife: قائمة قيم نصف العمر
-        grid_prior_global: قائمة قيم قوة الانكماش
-        grid_team_prior_w: قائمة أوزان البراير الهرمي
-        grid_rho_max: قائمة قيم الحد الأقصى لـ rho
-        rho_step: دقة شبكة rho
+        matches_by_season: قاموس المباريات مُجمّعة حسب الموسم
+        skip_tuning: إذا True، يتم تخطي البحث عن المعاملات واستخدام الافتراضية
+        min_matches: الحد الأدنى لعدد المباريات المقبولة لكل موسم
 
     العائد:
-        قائمة تركيبات المعاملات
+        قاموس يحتوي على جميع النماذج المدربة مُنظّمة حسب النوع
     """
-    combos = []
+    log("=" * 70, "INFO")
+    log("بدء عملية التدريب لجميع المواسم", "INFO")
+    log("=" * 70, "INFO")
 
-    for hf in grid_halflife:
-        for pg in grid_prior_global:
-            for tpw in grid_team_prior_w:
-                for rmax in grid_rho_max:
-                    combos.append({
-                        "halflife": int(hf),
-                        "prior_global": float(pg),
-                        "team_prior_w": float(tpw),
-                        "rho_max": float(rmax),
-                        "rho_step": float(rho_step),
-                    })
+    # بنية البيانات النهائية
+    trained_models = {
+        "team_factors": {},
+        "elo_ratings": {},
+        "league_averages": {},
+        "rho_values": {},
+        "best_params": {},
+        "training_metadata": {},
+    }
 
-    return combos
-
-
-def organize_seasons_by_competition(
-    by_season: Dict[str, List[Dict[str, Any]]],
-    comps: Optional[List[str]],
-    limit_seasons: Optional[int],
-) -> Dict[str, List[Tuple[str, List[Dict[str, Any]]]]]:
-    """
-    تنظيم المواسم حسب المسابقة مع تصفية وتقليص اختياري.
-
-    المعاملات:
-        by_season: جميع المواسم المُجمّعة
-        comps: قائمة المسابقات المطلوبة (None = الكل)
-        limit_seasons: حد أقصى لعدد المواسم الأخيرة لكل مسابقة
-
-    العائد:
-        قاموس: رمز المسابقة -> قائمة (مفتاح الموسم, المباريات) مرتبة زمنياً
-    """
-    # ترتيب المواسم
-    items = list(by_season.items())
-    items.sort(
-        key=lambda kv: (season_key_parts(kv[0])[0], season_key_parts(kv[0])[1])
+    # ترتيب المواسم زمنياً (مهم للبراير الهرمي)
+    sorted_seasons = sorted(
+        matches_by_season.items(),
+        key=lambda kv: parse_season_key(kv[0])
     )
 
-    # تجميع حسب المسابقة
-    comps_to_seasons: Dict[str, List[Tuple[str, List[Dict[str, Any]]]]] = defaultdict(list)
+    log(f"عدد المواسم: {len(sorted_seasons)}", "INFO")
+    log(
+        f"الترتيب الزمني: {[k for k, _ in sorted_seasons]}",
+        "INFO"
+    )
 
-    for sk, matches in items:
-        comp, yr = season_key_parts(sk)
+    if skip_tuning:
+        log("⚠ تم تخطي البحث عن المعاملات (--skip-tuning). سيتم استخدام القيم الافتراضية.", "WARNING")
 
-        # تصفية المسابقات إذا حُددت
-        if comps and comp not in comps:
+    # تتبع عوامل الموسم السابق لكل مسابقة (للبراير الهرمي)
+    last_factors_by_comp: Dict[str, Dict] = defaultdict(dict)
+
+    # عدادات
+    trained_count = 0
+    skipped_count = 0
+
+    for season_key, matches in sorted_seasons:
+        print("")
+        log(f"{'=' * 50}", "INFO")
+        log(f"الموسم: {season_key} ({len(matches)} مباراة)", "INFO")
+        log(f"{'=' * 50}", "INFO")
+
+        # التحقق من كفاية عدد المباريات
+        if len(matches) < min_matches:
+            log(
+                f"تجاهل الموسم {season_key}: "
+                f"عدد المباريات ({len(matches)}) أقل من الحد الأدنى ({min_matches}).",
+                "WARNING"
+            )
+            skipped_count += 1
             continue
 
-        comps_to_seasons[comp].append((sk, matches))
+        # تحديد رمز المسابقة
+        comp_code, season_year = parse_season_key(season_key)
 
-    # تقليص عدد المواسم إذا طُلب
-    if limit_seasons and limit_seasons > 0:
-        for comp in list(comps_to_seasons.keys()):
-            seasons_list = comps_to_seasons[comp]
-            if len(seasons_list) > limit_seasons:
-                comps_to_seasons[comp] = seasons_list[-limit_seasons:]
+        # استرجاع عوامل الموسم السابق (لنفس المسابقة)
+        prev_factors = last_factors_by_comp.get(comp_code, {})
 
-    return dict(comps_to_seasons)
+        if prev_factors:
+            log(f"  استخدام عوامل الموسم السابق كـ prior لـ {comp_code}.", "INFO")
+        else:
+            log(f"  لا توجد عوامل سابقة لـ {comp_code} (أول موسم).", "INFO")
 
+        try:
+            # --- الخطوة 1: البحث عن أفضل المعاملات ---
+            if skip_tuning:
+                best_params = get_default_params()
+                best_logloss = None
+                log("  استخدام المعاملات الافتراضية (تم تخطي البحث).", "INFO")
+            else:
+                best_params, best_logloss = find_best_params_for_season(
+                    matches, prev_factors, season_key
+                )
 
-def evaluate_single_combination(
-    combo: Dict[str, Any],
-    comps_to_seasons: Dict[str, List[Tuple[str, List[Dict[str, Any]]]]],
-    min_train: int,
-    block_size: int,
-    use_elo: bool,
-    ece_bins: int,
-) -> Dict[str, Any]:
-    """
-    تقييم تركيبة معاملات واحدة عبر جميع المسابقات والمواسم.
-
-    المعاملات:
-        combo: تركيبة المعاملات
-        comps_to_seasons: المواسم مُنظّمة حسب المسابقة
-        min_train: الحد الأدنى لمباريات التدريب
-        block_size: حجم كتلة الاختبار
-        use_elo: تفعيل ELO
-        ece_bins: عدد صناديق ECE
-
-    العائد:
-        قاموس يحتوي على نتائج التقييم الشاملة والتفصيلية
-    """
-    # تجميع شامل لجميع الاحتمالات والملصقات عبر كل المواسم
-    all_probs_global: List[Tuple[float, float, float]] = []
-    all_labels_global: List[int] = []
-
-    # نتائج تفصيلية لكل موسم
-    season_details: List[Dict[str, Any]] = []
-
-    # تتبع براير الموسم السابق لكل مسابقة
-    prev_prior_by_comp: Dict[str, Optional[Dict[str, Dict[str, float]]]] = {}
-
-    for comp, seasons in sorted(comps_to_seasons.items()):
-        for sk, matches in seasons:
-            # استرجاع براير الموسم السابق لهذه المسابقة
-            prev_prior = prev_prior_by_comp.get(comp)
-
-            # تنفيذ الباكتيست لهذا الموسم
-            result = backtest_season_expanding(
-                season_key=sk,
-                matches=matches,
-                halflife_days=combo["halflife"],
-                prior_global=combo["prior_global"],
-                team_prior_weight=combo["team_prior_w"],
-                rho_max=combo["rho_max"],
-                rho_step=combo["rho_step"],
-                min_train=min_train,
-                block_size=block_size,
-                use_elo=use_elo,
-                prev_season_prior=prev_prior,
-                ece_bins=ece_bins,
+            # --- الخطوة 2: تدريب النموذج النهائي ---
+            season_model = train_season_model(
+                season_key, matches, best_params, prev_factors
             )
 
-            # تجميع النتائج
-            n = result.get("n", 0)
-            mx = result.get("metrics", {})
+            # --- الخطوة 3: حفظ مكونات النموذج ---
+            trained_models["league_averages"][season_key] = season_model["league_averages"]
 
-            season_details.append({
-                "season_key": sk,
-                "n": n,
-                "logloss": mx.get("logloss"),
-                "brier": mx.get("brier"),
-                "accuracy": mx.get("accuracy"),
-                "ece": mx.get("ece"),
-            })
+            trained_models["team_factors"][season_key] = {
+                "attack": season_model["attack_factors"],
+                "defense": season_model["defense_factors"],
+            }
 
-            # تجميع شامل من الاحتمالات والملصقات الفعلية
-            season_probs = result.get("all_probs", [])
-            season_labels = result.get("all_labels", [])
-            all_probs_global.extend(season_probs)
-            all_labels_global.extend(season_labels)
+            trained_models["elo_ratings"][season_key] = season_model["elo_ratings"]
 
-            # تحديث براير الموسم السابق لهذه المسابقة
-            # يتم تدريب عوامل كاملة على كل مباريات الموسم الحالي
-            # لاستخدامها كبراير للموسم التالي
-            updated_prior = train_prior_for_next_season(
-                matches=matches,
-                halflife_days=combo["halflife"],
-                prior_global=combo["prior_global"],
-            )
+            trained_models["rho_values"][season_key] = season_model["rho"]
 
-            if updated_prior:
-                prev_prior_by_comp[comp] = updated_prior
+            trained_models["best_params"][season_key] = best_params
 
-    # حساب المقاييس الشاملة بدقة (من الاحتمالات والملصقات المُجمّعة)
-    global_metrics = compute_metrics(
-        all_probs_global, all_labels_global, ece_bins=ece_bins
-    )
+            trained_models["training_metadata"][season_key] = {
+                **season_model["metadata"],
+                "best_logloss": best_logloss,
+                "tuning_skipped": skip_tuning,
+            }
 
-    # بناء قاموس النتيجة
-    result = {
-        "halflife": combo["halflife"],
-        "prior_global": combo["prior_global"],
-        "team_prior_w": combo["team_prior_w"],
-        "rho_max": combo["rho_max"],
-        "rho_step": combo["rho_step"],
-        "use_elo": use_elo,
-        "total_samples": global_metrics.get("n", 0),
-        "logloss": global_metrics.get("logloss"),
-        "brier": global_metrics.get("brier"),
-        "accuracy": global_metrics.get("accuracy"),
-        "ece": global_metrics.get("ece"),
-        "by_season": season_details,
-    }
+            # --- الخطوة 4: تحديث عوامل الموسم السابق ---
+            last_factors_by_comp[comp_code] = {
+                "attack": season_model["attack_factors"],
+                "defense": season_model["defense_factors"],
+            }
 
-    return result
+            trained_count += 1
+            log(f"✅ اكتمل تدريب {season_key} بنجاح.", "INFO")
 
+        except Exception as e:
+            log(f"❌ فشل تدريب الموسم {season_key}: {e}", "ERROR")
+            traceback.print_exc()
+            skipped_count += 1
+            continue
 
-def format_metric(value: Optional[float], fmt: str = ".5f") -> str:
-    """
-    تنسيق قيمة مقياس للعرض.
-
-    المعاملات:
-        value: القيمة (قد تكون None)
-        fmt: تنسيق العرض
-
-    العائد:
-        نص منسّق
-    """
-    if value is None:
-        return "N/A"
-    return f"{value:{fmt}}"
-
-
-def print_combination_result(
-    combo_index: int,
-    total_combos: int,
-    combo: Dict[str, Any],
-    result: Dict[str, Any],
-):
-    """
-    طباعة نتائج تركيبة واحدة.
-
-    المعاملات:
-        combo_index: رقم التركيبة (يبدأ من 1)
-        total_combos: إجمالي عدد التركيبات
-        combo: تركيبة المعاملات
-        result: نتائج التقييم
-    """
-    log(
-        f"[{combo_index}/{total_combos}] "
-        f"halflife={combo['halflife']}, "
-        f"prior={combo['prior_global']}, "
-        f"team_prior_w={combo['team_prior_w']}, "
-        f"rho_max={combo['rho_max']}",
-        "INFO"
-    )
-
-    ll = format_metric(result.get("logloss"), ".5f")
-    br = format_metric(result.get("brier"), ".5f")
-    ac = format_metric(result.get("accuracy"), ".3f")
-    ec = format_metric(result.get("ece"), ".4f")
-    n = result.get("total_samples", 0)
-
-    log(
-        f"  النتائج: N={n}, LogLoss={ll} | Brier={br} | Acc={ac} | ECE={ec}",
-        "INFO"
-    )
-
-
-def print_best_result(best: Dict[str, Any]):
-    """
-    طباعة أفضل نتيجة مع اقتراح الإعدادات.
-
-    المعاملات:
-        best: أفضل نتيجة
-    """
+    # ملخص
     print("")
-    log("—" * 60, "INFO")
-    log("أفضل إعدادات حسب LogLoss:", "INFO")
-    log(
-        f"  halflife={best['halflife']} | "
-        f"prior_global={best['prior_global']} | "
-        f"team_prior_w={best['team_prior_w']} | "
-        f"rho_max={best['rho_max']} | "
-        f"rho_step={best['rho_step']} | "
-        f"use_elo={best['use_elo']}",
-        "INFO"
-    )
-    log(
-        f"  المقاييس: N={best['total_samples']} | "
-        f"LogLoss={format_metric(best.get('logloss'), '.5f')} | "
-        f"Brier={format_metric(best.get('brier'), '.5f')} | "
-        f"Acc={format_metric(best.get('accuracy'), '.3f')} | "
-        f"ECE={format_metric(best.get('ece'), '.4f')}",
-        "INFO"
-    )
+    log("=" * 70, "INFO")
+    log("ملخص التدريب", "INFO")
+    log(f"  تم تدريب: {trained_count} موسم", "INFO")
+    log(f"  تم تخطي: {skipped_count} موسم", "INFO")
+    log("=" * 70, "INFO")
 
-    # طباعة اقتراح الإعدادات
-    log("", "INFO")
-    log("اقتراح القيم لتثبيتها في common/config.py:", "INFO")
-    print(
-        f"""
-# common/config.py (اقتراح بناءً على نتائج الباكتيست)
-TEAM_FACTORS_HALFLIFE_DAYS = {best['halflife']}
-TEAM_FACTORS_PRIOR_GLOBAL = {best['prior_global']}
-TEAM_FACTORS_TEAM_PRIOR_WEIGHT = {best['team_prior_w']}
-DC_RHO_MIN = {-best['rho_max']:.3f}
-DC_RHO_MAX = {best['rho_max']:.3f}
-DC_RHO_STEP = {best['rho_step']}
-# استخدام ELO في Predictor عبر واجهة التطبيق (use_elo={best['use_elo']})
-"""
-    )
-
-    # عرض نتائج كل موسم
-    log("", "INFO")
-    log("تفاصيل كل موسم (أفضل تركيبة):", "INFO")
-    for s in best.get("by_season", []):
-        n = s.get("n", 0)
-        if n <= 0:
-            log(f"  {s.get('season_key', '?')}: لا توجد بيانات كافية", "DEBUG")
-            continue
-
-        log(
-            f"  {s.get('season_key', '?')}: "
-            f"N={n}, "
-            f"LogLoss={format_metric(s.get('logloss'), '.5f')}, "
-            f"Brier={format_metric(s.get('brier'), '.5f')}, "
-            f"Acc={format_metric(s.get('accuracy'), '.3f')}, "
-            f"ECE={format_metric(s.get('ece'), '.4f')}",
-            "INFO"
-        )
+    return trained_models
 
 
 # -----------------------------------------------------------------------------
-# القسم التاسع: حفظ النتائج
+# القسم السابع: حفظ النماذج المدربة
 # -----------------------------------------------------------------------------
 
 def create_backup(file_path: Path) -> Optional[Path]:
@@ -1241,18 +1141,14 @@ def create_backup(file_path: Path) -> Optional[Path]:
 
     try:
         shutil.copy2(file_path, backup_path)
-        log(f"نسخة احتياطية: {backup_path.name}", "DEBUG")
+        log(f"  نسخة احتياطية: {backup_path.name}", "DEBUG")
         return backup_path
     except OSError as e:
-        log(f"فشل إنشاء النسخة الاحتياطية: {e}", "WARNING")
+        log(f"  فشل إنشاء النسخة الاحتياطية: {e}", "WARNING")
         return None
 
 
-def cleanup_old_backups(
-    directory: Path,
-    base_name: str,
-    keep_last: int = MAX_BACKUPS
-):
+def cleanup_old_backups(directory: Path, base_name: str, keep_last: int = MAX_BACKUPS):
     """
     حذف النسخ الاحتياطية القديمة والإبقاء على آخر N نسخة.
 
@@ -1275,51 +1171,37 @@ def cleanup_old_backups(
         pass
 
 
-def save_backtest_results(
-    results_data: Dict[str, Any],
-    save_path: Path,
-    create_backups_flag: bool = True,
-) -> bool:
+def save_json_safely(data: Any, file_path: Path, description: str) -> bool:
     """
-    حفظ نتائج الباكتيست في ملف JSON.
+    حفظ بيانات JSON بأمان عبر ملف مؤقت ثم إعادة تسمية.
 
     المعاملات:
-        results_data: بيانات النتائج
-        save_path: مسار ملف الحفظ
-        create_backups_flag: إنشاء نسخة احتياطية
+        data: البيانات المراد حفظها
+        file_path: مسار الملف النهائي
+        description: وصف الملف (للتسجيل)
 
     العائد:
         True إذا تم الحفظ بنجاح
     """
+    temp_path = file_path.with_suffix(".tmp")
+
     try:
-        save_path.parent.mkdir(parents=True, exist_ok=True)
-
-        # إنشاء نسخة احتياطية
-        if create_backups_flag:
-            create_backup(save_path)
-            cleanup_old_backups(save_path.parent, save_path.stem)
-
-        # كتابة في ملف مؤقت أولاً
-        temp_path = save_path.with_suffix(".tmp")
-
         with open(temp_path, "w", encoding="utf-8") as f:
-            json.dump(results_data, f, ensure_ascii=False, indent=2, default=str)
+            json.dump(data, f, ensure_ascii=False, indent=2, sort_keys=True, default=str)
 
         # التحقق من صحة الملف
         with open(temp_path, "r", encoding="utf-8") as f:
             json.load(f)
 
         # نقل الملف المؤقت ليحلّ محل النهائي
-        temp_path.replace(save_path)
+        temp_path.replace(file_path)
 
-        file_size = save_path.stat().st_size
-        log(f"تم حفظ نتائج الباكتيست في: {save_path} ({file_size:,} بايت)", "INFO")
+        file_size = file_path.stat().st_size
+        log(f"  ✅ {description}: {file_path.name} ({file_size:,} بايت)", "INFO")
         return True
 
     except Exception as e:
-        log(f"فشل حفظ نتائج الباكتيست: {e}", "ERROR")
-        # تنظيف الملف المؤقت
-        temp_path = save_path.with_suffix(".tmp")
+        log(f"  ❌ فشل حفظ {description}: {e}", "ERROR")
         if temp_path.exists():
             try:
                 temp_path.unlink()
@@ -1328,114 +1210,285 @@ def save_backtest_results(
         return False
 
 
-def save_backtest_report(
-    report_path: Path,
-    best_result: Optional[Dict],
-    all_results: List[Dict],
-    run_config: Dict,
-    duration_seconds: float,
+def save_models(
+    trained_models: Dict[str, Dict[str, Any]],
+    create_backups_flag: bool = True
 ) -> bool:
     """
-    حفظ تقرير الباكتيست في ملف نصي قابل للقراءة.
+    حفظ جميع النماذج المدربة في ملفات JSON منفصلة.
 
     المعاملات:
-        report_path: مسار ملف التقرير
-        best_result: أفضل نتيجة
-        all_results: جميع النتائج
-        run_config: إعدادات التشغيل
-        duration_seconds: مدة العملية
+        trained_models: قاموس يحتوي على جميع النماذج المدربة
+        create_backups_flag: إنشاء نسخ احتياطية قبل الكتابة
 
     العائد:
-        True إذا تم الحفظ بنجاح
+        True إذا تم حفظ جميع الملفات بنجاح
     """
+    log("", "INFO")
+    log("=" * 70, "INFO")
+    log("حفظ النماذج المدربة", "INFO")
+    log("=" * 70, "INFO")
+
+    # التأكد من وجود مجلد النماذج
     try:
-        report_path.parent.mkdir(parents=True, exist_ok=True)
+        config.MODELS_DIR.mkdir(parents=True, exist_ok=True)
+    except OSError as e:
+        log(f"فشل في إنشاء مجلد النماذج: {e}", "CRITICAL")
+        return False
 
-        lines = []
-        lines.append("=" * 70)
-        lines.append("تقرير الاختبار التاريخي (Backtesting Report)")
-        lines.append(f"التاريخ: {datetime.now(timezone.utc).isoformat()}")
-        lines.append(f"المدة: {format_duration(duration_seconds)}")
-        lines.append("=" * 70)
-        lines.append("")
+    # قائمة الملفات المراد حفظها
+    files_to_save = [
+        (
+            "league_averages.json",
+            trained_models.get("league_averages", {}),
+            "متوسطات الدوري",
+        ),
+        (
+            "team_factors.json",
+            trained_models.get("team_factors", {}),
+            "عوامل الفرق",
+        ),
+        (
+            "elo_ratings.json",
+            trained_models.get("elo_ratings", {}),
+            "تقييمات ELO",
+        ),
+        (
+            "rho_values.json",
+            trained_models.get("rho_values", {}),
+            "قيم rho",
+        ),
+    ]
 
-        # إعدادات التشغيل
-        lines.append("إعدادات التشغيل:")
-        for key, value in run_config.items():
-            lines.append(f"  {key}: {value}")
-        lines.append("")
+    all_saved = True
 
-        # أفضل نتيجة
-        if best_result:
-            lines.append("أفضل إعدادات:")
-            lines.append(f"  halflife: {best_result.get('halflife')}")
-            lines.append(f"  prior_global: {best_result.get('prior_global')}")
-            lines.append(f"  team_prior_w: {best_result.get('team_prior_w')}")
-            lines.append(f"  rho_max: {best_result.get('rho_max')}")
-            lines.append(f"  rho_step: {best_result.get('rho_step')}")
-            lines.append("")
+    for filename, data, description in files_to_save:
+        file_path = config.MODELS_DIR / filename
 
-            lines.append("أفضل المقاييس:")
-            lines.append(f"  N: {best_result.get('total_samples', 0)}")
-            lines.append(f"  LogLoss: {format_metric(best_result.get('logloss'), '.5f')}")
-            lines.append(f"  Brier: {format_metric(best_result.get('brier'), '.5f')}")
-            lines.append(f"  Accuracy: {format_metric(best_result.get('accuracy'), '.3f')}")
-            lines.append(f"  ECE: {format_metric(best_result.get('ece'), '.4f')}")
-            lines.append("")
+        # إنشاء نسخة احتياطية
+        if create_backups_flag:
+            create_backup(file_path)
+            cleanup_old_backups(config.MODELS_DIR, file_path.stem)
 
-            # تفاصيل كل موسم
-            lines.append("تفاصيل كل موسم (أفضل تركيبة):")
-            for s in best_result.get("by_season", []):
-                n = s.get("n", 0)
-                if n <= 0:
-                    lines.append(f"  {s.get('season_key', '?')}: لا توجد بيانات كافية")
-                else:
-                    lines.append(
-                        f"  {s.get('season_key', '?')}: "
-                        f"N={n}, "
-                        f"LL={format_metric(s.get('logloss'), '.5f')}, "
-                        f"Br={format_metric(s.get('brier'), '.5f')}, "
-                        f"Acc={format_metric(s.get('accuracy'), '.3f')}, "
-                        f"ECE={format_metric(s.get('ece'), '.4f')}"
-                    )
-            lines.append("")
+        # حفظ الملف
+        saved = save_json_safely(data, file_path, description)
+        if not saved:
+            all_saved = False
 
-        # جميع النتائج
-        lines.append(f"جميع التركيبات ({len(all_results)}):")
-        lines.append("-" * 70)
+    # حفظ بيانات وصفية إضافية (اختيارية)
+    metadata_to_save = {
+        "training_completed_at": datetime.now(timezone.utc).isoformat(),
+        "version": getattr(config, "VERSION", "N/A"),
+        "seasons_trained": list(trained_models.get("league_averages", {}).keys()),
+        "best_params_per_season": trained_models.get("best_params", {}),
+        "training_metadata": trained_models.get("training_metadata", {}),
+    }
 
-        # ترتيب حسب LogLoss
-        sorted_results = sorted(
-            all_results,
-            key=lambda x: x.get("logloss") if x.get("logloss") is not None else 999.0
+    metadata_path = config.MODELS_DIR / "training_metadata.json"
+    save_json_safely(metadata_to_save, metadata_path, "البيانات الوصفية للتدريب")
+
+    if all_saved:
+        log("✅ تم حفظ جميع النماذج بنجاح.", "INFO")
+    else:
+        log("⚠ فشل حفظ بعض الملفات.", "WARNING")
+
+    return all_saved
+
+
+# -----------------------------------------------------------------------------
+# القسم الثامن: التقييم النهائي (اختياري)
+# -----------------------------------------------------------------------------
+
+def evaluate_final_models(
+    trained_models: Dict[str, Dict[str, Any]],
+    matches_by_season: Dict[str, List[Dict]]
+) -> Dict[str, Dict]:
+    """
+    تقييم النماذج المدربة على البيانات الكاملة لكل موسم
+    (للحصول على تقدير تقريبي للأداء — ليس تقييماً غير متحيز).
+
+    المعاملات:
+        trained_models: النماذج المدربة
+        matches_by_season: المباريات المُجمّعة حسب الموسم
+
+    العائد:
+        قاموس نتائج التقييم لكل موسم
+    """
+    log("", "INFO")
+    log("تقييم النماذج المدربة (تقييم تقريبي على بيانات التدريب):", "INFO")
+
+    evaluation_results = {}
+
+    for season_key in sorted(trained_models.get("league_averages", {}).keys()):
+        matches = matches_by_season.get(season_key, [])
+        if not matches:
+            continue
+
+        league_avgs = trained_models["league_averages"].get(season_key, {})
+        team_factors = trained_models["team_factors"].get(season_key, {})
+        rho = trained_models["rho_values"].get(season_key, 0.0)
+
+        factors_attack = team_factors.get("attack", {})
+        factors_defense = team_factors.get("defense", {})
+
+        # التنبؤ بجميع المباريات
+        predictions = []
+        for match in matches:
+            probs = predict_match_probabilities(
+                match, factors_attack, factors_defense, league_avgs, rho
+            )
+            predictions.append(probs)
+
+        # حساب Log-Loss
+        logloss = calculate_logloss(predictions, matches)
+
+        # حساب الدقة (Accuracy)
+        correct = 0
+        total = 0
+        for i, match in enumerate(matches):
+            result_index = get_actual_result_index(match)
+            if result_index is None:
+                continue
+
+            probs = predictions[i]
+            predicted_index = int(np.argmax(probs))
+
+            if predicted_index == result_index:
+                correct += 1
+            total += 1
+
+        accuracy = correct / total if total > 0 else 0.0
+
+        evaluation_results[season_key] = {
+            "logloss": round(float(logloss), 4),
+            "accuracy": round(float(accuracy), 4),
+            "num_matches": total,
+        }
+
+        log(
+            f"  {season_key}: "
+            f"Log-Loss = {logloss:.4f}, "
+            f"Accuracy = {accuracy:.2%} "
+            f"({total} مباراة)",
+            "INFO"
         )
 
-        for i, r in enumerate(sorted_results, 1):
-            lines.append(
-                f"  #{i}: "
-                f"hf={r.get('halflife')}, "
-                f"pg={r.get('prior_global')}, "
-                f"tpw={r.get('team_prior_w')}, "
-                f"rmax={r.get('rho_max')} → "
-                f"N={r.get('total_samples', 0)}, "
-                f"LL={format_metric(r.get('logloss'), '.5f')}, "
-                f"Acc={format_metric(r.get('accuracy'), '.3f')}"
+    return evaluation_results
+
+
+# -----------------------------------------------------------------------------
+# الدالة الرئيسية
+# -----------------------------------------------------------------------------
+
+def main(
+    skip_tuning: bool = False,
+    min_matches: int = DEFAULT_MIN_MATCHES_PER_SEASON,
+    evaluate: bool = True,
+    create_backups_flag: bool = True,
+    dry_run: bool = False,
+):
+    """
+    الدالة الرئيسية التي تنسق عملية تدريب النماذج.
+
+    المعاملات:
+        skip_tuning: تخطي البحث عن المعاملات
+        min_matches: الحد الأدنى لعدد المباريات لقبول الموسم
+        evaluate: تقييم النماذج بعد التدريب
+        create_backups_flag: إنشاء نسخ احتياطية
+        dry_run: تشغيل بدون حفظ
+    """
+    start_time = datetime.now(timezone.utc)
+
+    log("=" * 70, "INFO")
+    log("بدء عملية تدريب النماذج (Model Trainer)", "INFO")
+    log(f"الوقت: {start_time.isoformat()}", "INFO")
+    log(f"الإصدار: {getattr(config, 'VERSION', 'N/A')}", "INFO")
+    log("=" * 70, "INFO")
+
+    if dry_run:
+        log("⚠ وضع التشغيل الجاف (Dry Run): لن يتم حفظ أي ملفات.", "WARNING")
+
+    try:
+        # =====================================================================
+        # المرحلة 1: تحميل وتجميع البيانات
+        # =====================================================================
+        log("--- المرحلة 1: تحميل وتجميع البيانات ---", "INFO")
+        matches_by_season = load_and_group_matches()
+
+        if not matches_by_season:
+            log("لا توجد مباريات مُجمّعة. لا يمكن المتابعة.", "CRITICAL")
+            return
+
+        # =====================================================================
+        # المرحلة 2: تدريب النماذج
+        # =====================================================================
+        log("--- المرحلة 2: تدريب النماذج ---", "INFO")
+        trained_models = train_all_models(
+            matches_by_season,
+            skip_tuning=skip_tuning,
+            min_matches=min_matches,
+        )
+
+        # التحقق من وجود نماذج مدربة
+        trained_seasons = list(trained_models.get("league_averages", {}).keys())
+        if not trained_seasons:
+            log("لم يتم تدريب أي نموذج. تحقق من البيانات والإعدادات.", "CRITICAL")
+            return
+
+        log(f"تم تدريب نماذج لـ {len(trained_seasons)} موسم: {trained_seasons}", "INFO")
+
+        # =====================================================================
+        # المرحلة 3: تقييم النماذج (اختياري)
+        # =====================================================================
+        if evaluate:
+            log("--- المرحلة 3: تقييم النماذج ---", "INFO")
+            evaluation_results = evaluate_final_models(trained_models, matches_by_season)
+
+            # إضافة نتائج التقييم إلى البيانات الوصفية
+            trained_models["evaluation"] = evaluation_results
+        else:
+            log("--- المرحلة 3: تخطي التقييم ---", "INFO")
+
+        # =====================================================================
+        # المرحلة 4: حفظ النماذج
+        # =====================================================================
+        if dry_run:
+            log("--- المرحلة 4: تخطي الحفظ (وضع تجريبي) ---", "INFO")
+            log(f"[DRY RUN] كان سيتم حفظ نماذج لـ {len(trained_seasons)} موسم.", "INFO")
+        else:
+            log("--- المرحلة 4: حفظ النماذج ---", "INFO")
+            save_success = save_models(
+                trained_models,
+                create_backups_flag=create_backups_flag,
             )
 
-        lines.append("")
-        lines.append("=" * 70)
+            if not save_success:
+                log("⚠ فشل حفظ بعض الملفات.", "WARNING")
 
-        report_text = "\n".join(lines)
+    except FileNotFoundError as e:
+        log(f"ملف مطلوب غير موجود: {e}", "CRITICAL")
+        return
 
-        with open(report_path, "w", encoding="utf-8") as f:
-            f.write(report_text)
-
-        log(f"تم حفظ تقرير الباكتيست في: {report_path}", "INFO")
-        return True
+    except ValueError as e:
+        log(f"خطأ في البيانات: {e}", "CRITICAL")
+        return
 
     except Exception as e:
-        log(f"فشل حفظ تقرير الباكتيست: {e}", "WARNING")
-        return False
+        log(f"حدث خطأ غير متوقع أثناء عملية التدريب: {e}", "CRITICAL")
+        traceback.print_exc()
+        return
+
+    # =========================================================================
+    # ملخص نهائي
+    # =========================================================================
+    end_time = datetime.now(timezone.utc)
+    duration = (end_time - start_time).total_seconds()
+
+    print("")
+    log("=" * 70, "INFO")
+    log("انتهت عملية تدريب النماذج بنجاح ✅", "INFO")
+    log(f"المدة الإجمالية: {format_duration(duration)}", "INFO")
+    log("=" * 70, "INFO")
 
 
 def format_duration(seconds: float) -> str:
@@ -1461,482 +1514,73 @@ def format_duration(seconds: float) -> str:
 
 
 # -----------------------------------------------------------------------------
-# القسم العاشر: الدالة الرئيسية لتشغيل الباكتيست
+# نقطة الدخول
 # -----------------------------------------------------------------------------
 
-def run_backtester(
-    comps: Optional[List[str]],
-    min_train: int,
-    block_size: int,
-    grid_halflife: List[int],
-    grid_prior_global: List[float],
-    grid_team_prior_w: List[float],
-    grid_rho_max: List[float],
-    rho_step: float,
-    ece_bins: int,
-    limit_seasons: Optional[int],
-    use_elo: bool,
-    save: bool,
-    dry_run: bool = False,
-) -> None:
-    """
-    الدالة الرئيسية لتشغيل الباكتيست.
-
-    تقوم بـ:
-    1. تحميل البيانات وتنظيمها
-    2. توليد تركيبات المعاملات
-    3. تقييم كل تركيبة عبر جميع المواسم
-    4. تحديد أفضل التركيبات
-    5. حفظ النتائج (اختياري)
-
-    المعاملات:
-        comps: قائمة المسابقات المطلوبة (None = الكل)
-        min_train: الحد الأدنى لمباريات التدريب
-        block_size: حجم كتلة الاختبار
-        grid_halflife: شبكة قيم نصف العمر
-        grid_prior_global: شبكة قيم قوة الانكماش
-        grid_team_prior_w: شبكة أوزان البراير الهرمي
-        grid_rho_max: شبكة قيم الحد الأقصى لـ rho
-        rho_step: دقة شبكة rho
-        ece_bins: عدد صناديق ECE
-        limit_seasons: حد أقصى لعدد المواسم
-        use_elo: تفعيل ELO
-        save: حفظ النتائج
-        dry_run: تشغيل تجريبي
-    """
-    start_time = datetime.now(timezone.utc)
-
-    log("=" * 70, "INFO")
-    log("بدء الاختبار التاريخي (Backtesting)", "INFO")
-    log(f"الوقت: {start_time.isoformat()}", "INFO")
-    log("=" * 70, "INFO")
-
-    if dry_run:
-        log("⚠ وضع التشغيل الجاف (Dry Run): لن يتم حفظ أي ملفات.", "WARNING")
-
-    # =========================================================================
-    # 1. تحميل البيانات
-    # =========================================================================
-    log("--- المرحلة 1: تحميل البيانات ---", "INFO")
-
-    try:
-        all_matches = load_matches(config.DATA_DIR / "matches.json")
-    except Exception as e:
-        log(f"فشل تحميل البيانات: {e}", "CRITICAL")
-        return
-
-    if not all_matches:
-        log("لا توجد مباريات. لا يمكن إجراء الباكتيست.", "CRITICAL")
-        return
-
-    # =========================================================================
-    # 2. تجميع المباريات حسب الموسم
-    # =========================================================================
-    log("--- المرحلة 2: تجميع المباريات ---", "INFO")
-
-    by_season = group_matches_by_season(all_matches)
-
-    if not by_season:
-        log("لم يتم العثور على مواسم. لا يمكن إجراء الباكتيست.", "CRITICAL")
-        return
-
-    # =========================================================================
-    # 3. تنظيم المواسم حسب المسابقة
-    # =========================================================================
-    log("--- المرحلة 3: تنظيم المواسم ---", "INFO")
-
-    comps_to_seasons = organize_seasons_by_competition(
-        by_season, comps, limit_seasons
-    )
-
-    if not comps_to_seasons:
-        log("لا توجد مسابقات مطابقة. تحقق من قيم --comps.", "CRITICAL")
-        return
-
-    # عرض المسابقات والمواسم المختارة
-    for comp, seasons in sorted(comps_to_seasons.items()):
-        season_keys = [sk for sk, _ in seasons]
-        log(f"  {comp}: {len(seasons)} موسم — {season_keys}", "INFO")
-
-    # =========================================================================
-    # 4. توليد تركيبات المعاملات
-    # =========================================================================
-    log("--- المرحلة 4: توليد التركيبات ---", "INFO")
-
-    combos = generate_param_combinations(
-        grid_halflife=grid_halflife,
-        grid_prior_global=grid_prior_global,
-        grid_team_prior_w=grid_team_prior_w,
-        grid_rho_max=grid_rho_max,
-        rho_step=rho_step,
-    )
-
-    total_combos = len(combos)
-    log(f"عدد التركيبات: {total_combos}", "INFO")
-    log(f"  halflife: {grid_halflife}", "DEBUG")
-    log(f"  prior_global: {grid_prior_global}", "DEBUG")
-    log(f"  team_prior_w: {grid_team_prior_w}", "DEBUG")
-    log(f"  rho_max: {grid_rho_max}", "DEBUG")
-    log(f"  rho_step: {rho_step}", "DEBUG")
-
-    if dry_run:
-        log(
-            f"[DRY RUN] سيتم تقييم {total_combos} تركيبة "
-            f"عبر {sum(len(s) for s in comps_to_seasons.values())} موسم.",
-            "INFO"
-        )
-        return
-
-    # =========================================================================
-    # 5. تقييم كل تركيبة
-    # =========================================================================
-    log("--- المرحلة 5: تقييم التركيبات ---", "INFO")
-
-    overall_results: List[Dict[str, Any]] = []
-    best_candidates: List[Dict[str, Any]] = []
-
-    for ci, combo in enumerate(combos, start=1):
-        print("")
-        log(f"{'─' * 50}", "INFO")
-        log(f"التركيبة [{ci}/{total_combos}]:", "INFO")
-
-        try:
-            result = evaluate_single_combination(
-                combo=combo,
-                comps_to_seasons=comps_to_seasons,
-                min_train=min_train,
-                block_size=block_size,
-                use_elo=use_elo,
-                ece_bins=ece_bins,
-            )
-
-            # طباعة النتائج
-            print_combination_result(ci, total_combos, combo, result)
-
-            # حفظ النتيجة
-            overall_results.append(result)
-
-            # إضافة للمرشحين إذا كانت LogLoss صالحة
-            if result.get("logloss") is not None and result.get("total_samples", 0) > 0:
-                best_candidates.append(result)
-
-        except Exception as e:
-            log(f"خطأ أثناء تقييم التركيبة [{ci}]: {e}", "ERROR")
-            traceback.print_exc()
-            continue
-
-    # =========================================================================
-    # 6. اختيار الأفضل
-    # =========================================================================
-    log("", "INFO")
-    log("--- المرحلة 6: اختيار أفضل الإعدادات ---", "INFO")
-
-    best_result = None
-
-    if best_candidates:
-        # ترتيب حسب LogLoss (الأقل أفضل)، ثم ECE (الأقل أفضل)
-        best_candidates.sort(
-            key=lambda x: (
-                x.get("logloss", 999.0),
-                x.get("ece", 1e9) if x.get("ece") is not None else 1e9,
-            )
-        )
-
-        best_result = best_candidates[0]
-        print_best_result(best_result)
-
-        # عرض أفضل 3 تركيبات (إن وُجدت)
-        if len(best_candidates) > 1:
-            print("")
-            log("أفضل 3 تركيبات:", "INFO")
-            for i, candidate in enumerate(best_candidates[:3], 1):
-                log(
-                    f"  #{i}: "
-                    f"hf={candidate['halflife']}, "
-                    f"pg={candidate['prior_global']}, "
-                    f"tpw={candidate['team_prior_w']}, "
-                    f"rmax={candidate['rho_max']} → "
-                    f"LL={format_metric(candidate.get('logloss'), '.5f')}, "
-                    f"Acc={format_metric(candidate.get('accuracy'), '.3f')}, "
-                    f"ECE={format_metric(candidate.get('ece'), '.4f')}",
-                    "INFO"
-                )
-    else:
-        log("لم يتم العثور على نتائج صالحة.", "WARNING")
-
-    # =========================================================================
-    # 7. حفظ النتائج
-    # =========================================================================
-    if save and not dry_run:
-        log("", "INFO")
-        log("--- المرحلة 7: حفظ النتائج ---", "INFO")
-
-        # إعدادات التشغيل
-        run_config = {
-            "comps": comps,
-            "min_train": min_train,
-            "block_size": block_size,
-            "ece_bins": ece_bins,
-            "use_elo": use_elo,
-            "grid_halflife": grid_halflife,
-            "grid_prior_global": grid_prior_global,
-            "grid_team_prior_w": grid_team_prior_w,
-            "grid_rho_max": grid_rho_max,
-            "rho_step": rho_step,
-            "limit_seasons": limit_seasons,
-        }
-
-        # حفظ JSON
-        results_data = {
-            "version": getattr(config, "VERSION", "N/A"),
-            "run_timestamp": datetime.now(timezone.utc).isoformat(),
-            "run_config": run_config,
-            "best_result": best_result,
-            "all_results": overall_results,
-            "total_combinations": total_combos,
-        }
-
-        save_path = config.DATA_DIR / "backtest_results.json"
-        save_backtest_results(results_data, save_path)
-
-        # حفظ تقرير نصي
-        end_time = datetime.now(timezone.utc)
-        duration = (end_time - start_time).total_seconds()
-
-        report_path = config.DATA_DIR / "backtest_report.txt"
-        save_backtest_report(
-            report_path=report_path,
-            best_result=best_result,
-            all_results=overall_results,
-            run_config=run_config,
-            duration_seconds=duration,
-        )
-
-    # =========================================================================
-    # ملخص نهائي
-    # =========================================================================
-    end_time = datetime.now(timezone.utc)
-    duration = (end_time - start_time).total_seconds()
-
-    print("")
-    log("=" * 70, "INFO")
-    log("انتهى الاختبار التاريخي", "INFO")
-    log(f"المدة: {format_duration(duration)}", "INFO")
-    log(f"عدد التركيبات المُقيّمة: {len(overall_results)}/{total_combos}", "INFO")
-
-    if best_result:
-        log(
-            f"أفضل LogLoss: {format_metric(best_result.get('logloss'), '.5f')} "
-            f"(N={best_result.get('total_samples', 0)})",
-            "INFO"
-        )
-
-    log("=" * 70, "INFO")
-
-
-# -----------------------------------------------------------------------------
-# نقطة الدخول (CLI)
-# -----------------------------------------------------------------------------
-
-def main():
-    """
-    نقطة الدخول الرئيسية — تحليل سطر الأوامر وتشغيل الباكتيست.
-    """
+if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description="اختبار تاريخي للنموذج الإحصائي (Dixon–Coles + Team Factors + ELO).",
+        description="تدريب النماذج الإحصائية (Dixon-Coles + ELO + Team Factors)",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 أمثلة الاستخدام:
-  python 03_backtester.py --save
-  python 03_backtester.py --comps PL PD --use-elo --save
-  python 03_backtester.py --grid-halflife 90,180,365 --grid-prior-global 2.0,3.0 --save
-  python 03_backtester.py --min-train 100 --block-size 30 --limit-seasons 3 --save
-  python 03_backtester.py --dry-run
+  python 02_trainer.py                      # تدريب كامل مع بحث عن المعاملات
+  python 02_trainer.py --skip-tuning        # تدريب سريع بدون بحث
+  python 02_trainer.py --min-matches 30     # تقليل الحد الأدنى للمباريات
+  python 02_trainer.py --no-eval            # بدون تقييم بعد التدريب
+  python 02_trainer.py --dry-run            # تشغيل تجريبي بدون حفظ
         """
     )
 
-    # إعدادات المسابقات
     parser.add_argument(
-        "--comps",
-        nargs="*",
-        default=None,
-        help="رموز المسابقات المطلوب اختبارها (مثل: PL PD SA BL1 FL1). "
-             "إذا لم تُحدد، تُستخدم TARGET_COMPETITIONS من الإعدادات."
-    )
-
-    # إعدادات النافذة
-    parser.add_argument(
-        "--min-train",
-        type=int,
-        default=DEFAULT_MIN_TRAIN,
-        help=f"أدنى عدد مباريات للتدريب قبل أول تقييم. (افتراضي: {DEFAULT_MIN_TRAIN})"
-    )
-
-    parser.add_argument(
-        "--block-size",
-        type=int,
-        default=DEFAULT_BLOCK_SIZE,
-        help=f"حجم كتلة الاختبار في كل خطوة. (افتراضي: {DEFAULT_BLOCK_SIZE})"
-    )
-
-    # شبكة المعاملات
-    parser.add_argument(
-        "--grid-halflife",
-        type=str,
-        default=",".join(str(x) for x in DEFAULT_GRID_HALFLIFE),
-        help=f"قائمة نصف العمر بالأيام (مفصولة بفواصل). (افتراضي: {DEFAULT_GRID_HALFLIFE})"
-    )
-
-    parser.add_argument(
-        "--grid-prior-global",
-        type=str,
-        default=",".join(str(x) for x in DEFAULT_GRID_PRIOR_GLOBAL),
-        help=f"قائمة قوة الانكماش Gamma. (افتراضي: {DEFAULT_GRID_PRIOR_GLOBAL})"
-    )
-
-    parser.add_argument(
-        "--grid-team-prior-weight",
-        type=str,
-        default=",".join(str(x) for x in DEFAULT_GRID_TEAM_PRIOR_WEIGHT),
-        help=f"أوزان الانكماش الهرمي. (افتراضي: {DEFAULT_GRID_TEAM_PRIOR_WEIGHT})"
-    )
-
-    parser.add_argument(
-        "--grid-rho-max",
-        type=str,
-        default=",".join(str(x) for x in DEFAULT_GRID_RHO_MAX),
-        help=f"قيم الحد الأقصى |ρ|. (افتراضي: {DEFAULT_GRID_RHO_MAX})"
-    )
-
-    parser.add_argument(
-        "--rho-step",
-        type=float,
-        default=DEFAULT_RHO_STEP,
-        help=f"دقة شبكة rho. (افتراضي: {DEFAULT_RHO_STEP})"
-    )
-
-    # إعدادات التقييم
-    parser.add_argument(
-        "--ece-bins",
-        type=int,
-        default=DEFAULT_ECE_BINS,
-        help=f"عدد صناديق ECE. (افتراضي: {DEFAULT_ECE_BINS})"
-    )
-
-    parser.add_argument(
-        "--limit-seasons",
-        type=int,
-        default=0,
-        help="حصر عدد المواسم الأخيرة لكل دوري (0 = كل المواسم). (افتراضي: 0)"
-    )
-
-    # خيارات التشغيل
-    parser.add_argument(
-        "--use-elo",
+        "--skip-tuning",
         action="store_true",
-        help="تفعيل استخدام ELO لتعديل λ أثناء التوقع."
+        default=False,
+        help="تخطي البحث عن أفضل المعاملات (Hyperparameter Tuning) واستخدام القيم الافتراضية."
     )
 
     parser.add_argument(
-        "--save",
+        "--min-matches",
+        type=int,
+        default=DEFAULT_MIN_MATCHES_PER_SEASON,
+        help=f"الحد الأدنى لعدد المباريات المطلوبة لقبول الموسم للتدريب. (افتراضي: {DEFAULT_MIN_MATCHES_PER_SEASON})"
+    )
+
+    parser.add_argument(
+        "--no-eval",
         action="store_true",
-        help="حفظ نتائج الباكتيست في data/backtest_results.json"
+        default=False,
+        help="تخطي تقييم النماذج بعد التدريب."
+    )
+
+    parser.add_argument(
+        "--no-backup",
+        action="store_true",
+        default=False,
+        help="تعطيل إنشاء النسخ الاحتياطية قبل الكتابة فوق الملفات."
     )
 
     parser.add_argument(
         "--dry-run",
         action="store_true",
         default=False,
-        help="تشغيل تجريبي: عرض الإعدادات بدون تنفيذ فعلي."
+        help="تشغيل تجريبي: تنفيذ التدريب بدون حفظ أي ملفات."
     )
 
     args = parser.parse_args()
 
-    # تحديد المسابقات
-    comps = args.comps
-    if not comps:
-        # محاولة الحصول على المسابقات من الإعدادات
-        target_comps = getattr(config, "TARGET_COMPETITIONS", None)
-        if target_comps:
-            if isinstance(target_comps, list):
-                comps = target_comps
-            elif isinstance(target_comps, dict):
-                comps = list(target_comps.keys())
-
-    # تحليل شبكات المعاملات
-    halflife_values = parse_grid_list_ints(args.grid_halflife)
-    prior_global_values = parse_grid_list_floats(args.grid_prior_global)
-    team_prior_w_values = parse_grid_list_floats(args.grid_team_prior_weight)
-    rho_max_values = parse_grid_list_floats(args.grid_rho_max)
-
-    # التحقق من وجود قيم في الشبكات
-    if not halflife_values:
-        halflife_values = DEFAULT_GRID_HALFLIFE
-        log("شبكة halflife فارغة. استخدام القيم الافتراضية.", "WARNING")
-
-    if not prior_global_values:
-        prior_global_values = DEFAULT_GRID_PRIOR_GLOBAL
-        log("شبكة prior_global فارغة. استخدام القيم الافتراضية.", "WARNING")
-
-    if not team_prior_w_values:
-        team_prior_w_values = DEFAULT_GRID_TEAM_PRIOR_WEIGHT
-        log("شبكة team_prior_weight فارغة. استخدام القيم الافتراضية.", "WARNING")
-
-    if not rho_max_values:
-        rho_max_values = DEFAULT_GRID_RHO_MAX
-        log("شبكة rho_max فارغة. استخدام القيم الافتراضية.", "WARNING")
-
-    # تحديد حد المواسم
-    limit_seasons = args.limit_seasons if args.limit_seasons > 0 else None
-
-    # عرض الإعدادات
-    log("إعدادات الباكتيست:", "INFO")
-    log(f"  المسابقات: {comps or 'الكل'}", "INFO")
-    log(f"  min_train: {args.min_train}", "INFO")
-    log(f"  block_size: {args.block_size}", "INFO")
-    log(f"  use_elo: {args.use_elo}", "INFO")
-    log(f"  limit_seasons: {limit_seasons or 'الكل'}", "INFO")
-    log(f"  ece_bins: {args.ece_bins}", "INFO")
-    log(f"  شبكة halflife: {halflife_values}", "INFO")
-    log(f"  شبكة prior_global: {prior_global_values}", "INFO")
-    log(f"  شبكة team_prior_w: {team_prior_w_values}", "INFO")
-    log(f"  شبكة rho_max: {rho_max_values}", "INFO")
-    log(f"  rho_step: {args.rho_step}", "INFO")
-
-    total_combos = (
-        len(halflife_values)
-        * len(prior_global_values)
-        * len(team_prior_w_values)
-        * len(rho_max_values)
-    )
-    log(f"  إجمالي التركيبات: {total_combos}", "INFO")
-
-    # تشغيل الباكتيست
     try:
-        run_backtester(
-            comps=comps,
-            min_train=args.min_train,
-            block_size=args.block_size,
-            grid_halflife=halflife_values,
-            grid_prior_global=prior_global_values,
-            grid_team_prior_w=team_prior_w_values,
-            grid_rho_max=rho_max_values,
-            rho_step=args.rho_step,
-            ece_bins=args.ece_bins,
-            limit_seasons=limit_seasons,
-            use_elo=args.use_elo,
-            save=args.save,
+        main(
+            skip_tuning=args.skip_tuning,
+            min_matches=args.min_matches,
+            evaluate=not args.no_eval,
+            create_backups_flag=not args.no_backup,
             dry_run=args.dry_run,
         )
     except KeyboardInterrupt:
         print("")
-        log("تم إيقاف الباكتيست بواسطة المستخدم (Ctrl+C).", "WARNING")
+        log("تم إيقاف العملية بواسطة المستخدم (Ctrl+C).", "WARNING")
         sys.exit(1)
     except Exception as e:
         log(f"خطأ غير متوقع: {e}", "CRITICAL")
         traceback.print_exc()
         sys.exit(1)
-
-
-if __name__ == "__main__":
-    main()
