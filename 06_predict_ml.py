@@ -1,92 +1,433 @@
-# predictor.py
+# 06_predict_ml.py
 # -----------------------------------------------------------------------------
-# كلاس Predictor موحّد للتنبؤ بنتائج المباريات باستخدام نموذج Dixon-Coles.
+# الوصف:
+# السكريبت النهائي للتنبؤ بنتيجة مباراة قادمة باستخدام نموذج XGBoost المدرب.
 #
 # يقوم بـ:
-# 1. تحميل النماذج الإحصائية المدرّبة (Team Factors, ELO, League Averages, Rho)
-# 2. البحث عن الفرق بالاسم أو المعرّف
-# 3. حساب معدّلات الأهداف المتوقعة (λ) مع إمكانية تعديل ELO
-# 4. حساب مصفوفة الاحتمالات (Dixon-Coles + Poisson)
-# 5. إرجاع احتمالات (فوز المضيف، تعادل، فوز الضيف) وأفضل النتائج المحتملة
+# 1. تحميل نموذج XGBoost المدرب والبيانات الإحصائية المطلوبة
+# 2. بناء ميزات المباراة المستهدفة
+# 3. إجراء التنبؤ واستخراج الاحتمالات
+# 4. عرض النتائج وحفظها (اختياري)
 #
 # التحسينات:
-# - معالجة أخطاء شاملة عند تحميل الملفات (لا يتوقف التطبيق إذا كان ملف مفقوداً)
-# - إصلاح type hint لـ _adjust_lambdas_with_elo (Tuple بدلاً من tuple القديم)
-# - التحقق من صحة البيانات المحمّلة
-# - دعم إعادة تحميل النماذج بدون إعادة إنشاء الكائن
-# - بحث أكثر ذكاءً عن الموسم المناسب (يبحث في أكثر من موسمين)
-# - تسجيل أوضح مع رسائل خطأ مفصّلة
-# - حماية من القيم غير الصالحة (NaN, Inf, سالبة)
-# - إضافة بيانات وصفية أغنى في النتيجة
-# - دعم التنبؤ بالمعرّف مباشرة بدلاً من الاسم فقط
-# - إضافة التحقق من توافق الميزات
-# - توثيق شامل لجميع الدوال
+# - استبدال LabelEncoder بـ model.classes_ لضمان التوافق مع النموذج المدرّب
+# - حماية استيراد المكتبات (xgboost, sklearn)
+# - دعم معاملات سطر الأوامر (--home, --away, --comp, --season)
+# - تحميل أسماء الفرق من teams.json لعرض أوضح
+# - تحميل البيانات الوصفية للنموذج (xgboost_metadata.json) للتحقق من التوافق
+# - إصلاح مشكلة مقارنة التواريخ (naive vs aware)
+# - حماية من القيم الفارغة والأخطاء غير المتوقعة
+# - دعم حفظ نتيجة التنبؤ في ملف JSON
+# - دعم التنبؤ باسم الفريق بدلاً من المعرّف فقط
+# - إضافة تقرير مفصّل يشمل الميزات المستخدمة والثقة
+# - دعم وضع التشغيل الجاف (--dry-run)
+#
+# الاستخدام:
+#   python 06_predict_ml.py
+#   python 06_predict_ml.py --home 65 --away 64 --comp PL --season 2025
+#   python 06_predict_ml.py --home-name "Manchester City" --away-name "Liverpool" --comp PL
+#   python 06_predict_ml.py --home 65 --away 64 --comp PL --save
 # -----------------------------------------------------------------------------
 
+import sys
+import os
 import json
-import math
+import argparse
+import traceback
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Dict, List, Tuple, Optional, Any, Union
+from typing import Dict, List, Any, Tuple, Optional
+
+# --- إضافة مسار المشروع الرئيسي إلى بايثون ---
+project_root = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, project_root)
+
+# مكتبات بيانات
+try:
+    import pandas as pd
+except ImportError:
+    print("خطأ: مكتبة pandas غير مثبتة. يرجى تثبيتها: pip install pandas")
+    sys.exit(1)
+
+try:
+    import numpy as np
+except ImportError:
+    np = None
+
+# قد لا يتوفر XGBoost في كل بيئة تشغيل
+try:
+    import xgboost as xgb
+except ImportError:
+    xgb = None
 
 # استيراد الوحدات المشتركة
 from common import config
-from common.utils import log, enhanced_team_search
+from common.utils import log, parse_date_safe, parse_score
 
-# استيراد دوال النمذجة
-from common.modeling import (
-    poisson_matrix_dc,
-    matrix_to_outcomes,
-    top_scorelines,
-    suggest_goal_cutoff,
-)
+
+# -----------------------------------------------------------------------------
+# استيراد calculate_team_form مع حماية التواريخ
+# -----------------------------------------------------------------------------
+
+def to_naive_utc(dt: Optional[datetime]) -> Optional[datetime]:
+    """
+    تحويل أي كائن datetime إلى naive-UTC لمنع أخطاء المقارنة.
+
+    المعاملات:
+        dt: كائن datetime (قد يكون aware أو naive أو None)
+
+    العائد:
+        datetime بدون معلومات منطقة زمنية (naive-UTC)، أو None
+    """
+    if dt is None:
+        return None
+    try:
+        if dt.tzinfo is None:
+            return dt
+        return dt.astimezone(timezone.utc).replace(tzinfo=None)
+    except Exception:
+        return dt
+
+
+# محاولة استيراد الدالة الأصلية
+try:
+    from common.modeling import calculate_team_form as _calculate_team_form_base
+
+    def calculate_team_form(
+        all_matches: List[Dict],
+        team_id: int,
+        ref_date: datetime,
+        num_matches: int = 5,
+    ) -> Dict[str, Any]:
+        """
+        غلاف حول calculate_team_form الأصلية مع توحيد التواريخ إلى naive-UTC.
+
+        المعاملات:
+            all_matches: جميع المباريات
+            team_id: معرّف الفريق
+            ref_date: التاريخ المرجعي
+            num_matches: عدد المباريات الأخيرة
+
+        العائد:
+            قاموس يحتوي على avg_points وغيرها
+        """
+        ref_date = to_naive_utc(ref_date)
+        return _calculate_team_form_base(
+            all_matches, team_id, ref_date, num_matches=num_matches
+        )
+
+except ImportError:
+
+    def calculate_team_form(
+        all_matches: List[Dict],
+        team_id: int,
+        ref_date: datetime,
+        num_matches: int = 5,
+    ) -> Dict[str, Any]:
+        """
+        بديل بسيط لحساب فورمة الفريق.
+        يبحث عن آخر num_matches مباراة قبل ref_date ويحسب متوسط النقاط.
+
+        المعاملات:
+            all_matches: جميع المباريات
+            team_id: معرّف الفريق
+            ref_date: التاريخ المرجعي
+            num_matches: عدد المباريات الأخيرة
+
+        العائد:
+            قاموس يحتوي على avg_points و matches_found
+        """
+        ref_date = to_naive_utc(ref_date)
+
+        if ref_date is None:
+            return {"avg_points": 1.0, "matches_found": 0}
+
+        rows = []
+        for m in all_matches:
+            dt = parse_date_safe(m.get("utcDate"))
+            dt = to_naive_utc(dt)
+
+            if dt is None or dt >= ref_date:
+                continue
+
+            h = m.get("homeTeam", {}).get("id")
+            a = m.get("awayTeam", {}).get("id")
+
+            if h is None or a is None:
+                continue
+
+            if int(h) != team_id and int(a) != team_id:
+                continue
+
+            hg, ag = parse_score(m)
+            if hg is None or ag is None:
+                continue
+
+            if int(h) == team_id:
+                pts = 3 if hg > ag else (1 if hg == ag else 0)
+            else:
+                pts = 3 if ag > hg else (1 if hg == ag else 0)
+
+            rows.append((dt, pts))
+
+        rows.sort(key=lambda x: x[0], reverse=True)
+        last = rows[:num_matches]
+
+        if not last:
+            return {"avg_points": 1.0, "matches_found": 0}
+
+        avg_pts = sum(p for _, p in last) / len(last)
+        return {"avg_points": avg_pts, "matches_found": len(last)}
 
 
 # -----------------------------------------------------------------------------
 # ثوابت
 # -----------------------------------------------------------------------------
 
-# القيمة الافتراضية لتقييم ELO للفرق غير المعروفة
-DEFAULT_ELO = 1500.0
+# قائمة الميزات المتوقعة (يجب أن تتطابق مع 04_feature_generator و 05_train_ml_model)
+EXPECTED_FEATURES = [
+    "home_attack",
+    "away_attack",
+    "home_defense",
+    "away_defense",
+    "home_elo",
+    "away_elo",
+    "elo_diff",
+    "home_avg_points",
+    "away_avg_points",
+]
 
-# القيم الافتراضية لمتوسطات الدوري
-DEFAULT_AVG_HOME_GOALS = 1.40
-DEFAULT_AVG_AWAY_GOALS = 1.10
+# الفئات المتوقعة
+EXPECTED_CLASSES = [-1, 0, 1]
 
-# القيمة الافتراضية لعوامل الفرق
-DEFAULT_FACTOR = 1.0
+# أسماء الفئات بالعربية
+CLASS_LABELS = {
+    -1: "فوز الضيف (Away Win)",
+    0: "تعادل (Draw)",
+    1: "فوز المضيف (Home Win)",
+}
 
-# القيمة الافتراضية لمعامل الارتباط rho
-DEFAULT_RHO = 0.0
+# عدد المباريات الافتراضي لحساب الفورمة
+DEFAULT_FORM_MATCHES = 5
 
-# الحد الأقصى لعدد المواسم السابقة للبحث عن نموذج متاح
-MAX_SEASON_LOOKBACK = 5
-
-# الحد الأدنى لقيمة lambda (لمنع القسمة على صفر)
-MIN_LAMBDA = 1e-6
+# القيم الافتراضية للمباراة التجريبية
+DEFAULT_HOME_TEAM_ID = 65   # Manchester City
+DEFAULT_AWAY_TEAM_ID = 64   # Liverpool
+DEFAULT_COMP_CODE = "PL"
 
 
 # -----------------------------------------------------------------------------
-# دوال مساعدة
+# القسم الأول: تحميل البيانات والنماذج
 # -----------------------------------------------------------------------------
 
-def current_season_year(now: Optional[datetime] = None) -> int:
+def check_dependencies() -> bool:
     """
-    تحديد سنة بداية الموسم الكروي الحالي.
+    التحقق من توفر جميع المكتبات المطلوبة.
 
-    يستخدم config.CURRENT_SEASON_START_MONTH لتحديد شهر بداية الموسم.
-    مثلاً: إذا كان شهر البداية هو 7 (يوليو) وكنا في يونيو 2025،
-    فالموسم الحالي بدأ في 2024.
+    العائد:
+        True إذا كانت جميع المكتبات متوفرة
+    """
+    missing = []
+
+    if xgb is None:
+        missing.append("xgboost")
+
+    if missing:
+        log(
+            f"المكتبات التالية غير متوفرة: {', '.join(missing)}. "
+            f"يرجى تثبيتها عبر: pip install {' '.join(missing)}",
+            "CRITICAL"
+        )
+        return False
+
+    return True
+
+
+def load_json_file(path: Path, description: str) -> Optional[Any]:
+    """
+    تحميل ملف JSON بأمان.
 
     المعاملات:
-        now: التاريخ الحالي (اختياري، يُستخدم datetime.now() إن لم يُحدد)
+        path: مسار الملف
+        description: وصف الملف (للرسائل)
+
+    العائد:
+        محتوى الملف، أو None في حالة الفشل
+    """
+    if not path.exists():
+        log(f"ملف {description} غير موجود: {path}", "ERROR")
+        return None
+
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+
+        log(f"تم تحميل {description}: {path.name}", "INFO")
+        return data
+
+    except json.JSONDecodeError as e:
+        log(f"خطأ في تحليل ملف {description}: {e}", "ERROR")
+        return None
+    except Exception as e:
+        log(f"خطأ أثناء تحميل {description}: {e}", "ERROR")
+        return None
+
+
+def load_xgb_model(model_path: Path) -> Optional[Any]:
+    """
+    تحميل نموذج XGBoost المدرّب.
+
+    المعاملات:
+        model_path: مسار ملف النموذج
+
+    العائد:
+        نموذج XGBoost مُحمّل، أو None في حالة الفشل
+    """
+    if xgb is None:
+        log("مكتبة xgboost غير مثبتة.", "CRITICAL")
+        return None
+
+    if not model_path.exists():
+        log(
+            f"ملف نموذج XGBoost غير موجود: {model_path}. "
+            f"يرجى تشغيل 05_train_ml_model.py أولاً.",
+            "CRITICAL"
+        )
+        return None
+
+    try:
+        model = xgb.XGBClassifier()
+        model.load_model(str(model_path))
+        log(f"تم تحميل نموذج XGBoost: {model_path.name}", "INFO")
+
+        # عرض معلومات النموذج
+        model_classes = list(model.classes_)
+        log(f"  فئات النموذج (model.classes_): {model_classes}", "DEBUG")
+
+        return model
+
+    except Exception as e:
+        log(f"فشل تحميل نموذج XGBoost: {e}", "CRITICAL")
+        return None
+
+
+def load_model_metadata(metadata_path: Path) -> Optional[Dict]:
+    """
+    تحميل البيانات الوصفية للنموذج المدرّب (إن وُجدت).
+    هذه البيانات تُستخدم للتحقق من توافق الميزات والفئات.
+
+    المعاملات:
+        metadata_path: مسار ملف البيانات الوصفية
+
+    العائد:
+        قاموس البيانات الوصفية، أو None
+    """
+    if not metadata_path.exists():
+        log(
+            "ملف البيانات الوصفية للنموذج غير موجود (اختياري). "
+            "سيتم استخدام الإعدادات الافتراضية.",
+            "DEBUG"
+        )
+        return None
+
+    return load_json_file(metadata_path, "بيانات وصفية للنموذج")
+
+
+def load_teams_map(teams_path: Path) -> Optional[Dict]:
+    """
+    تحميل خريطة الفرق لعرض أسماء الفرق بدلاً من المعرّفات فقط.
+
+    المعاملات:
+        teams_path: مسار ملف teams.json
+
+    العائد:
+        قاموس الفرق، أو None
+    """
+    return load_json_file(teams_path, "خريطة الفرق")
+
+
+def load_all_prediction_data() -> Optional[Dict[str, Any]]:
+    """
+    تحميل جميع الملفات المطلوبة للتنبؤ.
+
+    العائد:
+        قاموس يحتوي على جميع البيانات المحمّلة، أو None في حالة الفشل
+    """
+    log("جارٍ تحميل البيانات والنماذج المطلوبة...", "INFO")
+
+    # تحميل المباريات
+    all_matches = load_json_file(
+        config.DATA_DIR / "matches.json",
+        "بيانات المباريات"
+    )
+    if all_matches is None:
+        log(
+            "فشل تحميل بيانات المباريات. يرجى تشغيل 01_pipeline.py أولاً.",
+            "CRITICAL"
+        )
+        return None
+
+    # تحميل عوامل الفرق
+    team_factors = load_json_file(
+        config.MODELS_DIR / "team_factors.json",
+        "عوامل الفرق"
+    )
+    if team_factors is None:
+        log(
+            "فشل تحميل عوامل الفرق. يرجى تشغيل 02_trainer.py أولاً.",
+            "CRITICAL"
+        )
+        return None
+
+    # تحميل تقييمات ELO
+    elo_ratings = load_json_file(
+        config.MODELS_DIR / "elo_ratings.json",
+        "تقييمات ELO"
+    )
+    if elo_ratings is None:
+        log(
+            "فشل تحميل تقييمات ELO. يرجى تشغيل 02_trainer.py أولاً.",
+            "CRITICAL"
+        )
+        return None
+
+    # تحميل نموذج XGBoost
+    model = load_xgb_model(config.MODELS_DIR / "xgboost_model.json")
+    if model is None:
+        return None
+
+    # تحميل البيانات الوصفية (اختياري)
+    model_metadata = load_model_metadata(
+        config.MODELS_DIR / "xgboost_metadata.json"
+    )
+
+    # تحميل خريطة الفرق (اختياري — لعرض الأسماء)
+    teams_map = load_teams_map(config.DATA_DIR / "teams.json")
+
+    log("تم تحميل جميع البيانات بنجاح.", "INFO")
+
+    return {
+        "all_matches": all_matches,
+        "team_factors": team_factors,
+        "elo_ratings": elo_ratings,
+        "model": model,
+        "model_metadata": model_metadata,
+        "teams_map": teams_map,
+    }
+
+
+# -----------------------------------------------------------------------------
+# القسم الثاني: البحث عن الفرق
+# -----------------------------------------------------------------------------
+
+def get_current_season_year() -> int:
+    """
+    تحديد سنة بداية الموسم الحالي.
 
     العائد:
         سنة بداية الموسم الحالي
     """
-    if now is None:
-        now = datetime.now()
-
+    now = datetime.now()
     season_start_month = getattr(config, "CURRENT_SEASON_START_MONTH", 7)
 
     if now.month >= season_start_month:
@@ -95,939 +436,1003 @@ def current_season_year(now: Optional[datetime] = None) -> int:
         return now.year - 1
 
 
-def safe_float(value: Any, default: float = 0.0) -> float:
+def find_team_id_by_name(
+    teams_map: Optional[Dict],
+    team_name: str,
+    comp_code: Optional[str] = None,
+) -> Optional[int]:
     """
-    تحويل قيمة إلى float بأمان مع التعامل مع القيم غير الصالحة.
+    البحث عن معرّف فريق بناءً على اسمه.
+
+    يبحث في خريطة الفرق عن تطابق جزئي (case-insensitive).
 
     المعاملات:
-        value: القيمة المراد تحويلها
-        default: القيمة الافتراضية في حالة الفشل
+        teams_map: خريطة الفرق
+        team_name: اسم الفريق المطلوب
+        comp_code: رمز المسابقة (اختياري — لتضييق البحث)
 
     العائد:
-        القيمة كـ float، أو القيمة الافتراضية
+        معرّف الفريق، أو None إذا لم يُوجد
     """
-    try:
-        result = float(value)
-        if math.isnan(result) or math.isinf(result):
-            return default
-        return result
-    except (TypeError, ValueError):
-        return default
+    if teams_map is None or not team_name:
+        return None
 
+    team_name_lower = team_name.lower().strip()
+    candidates = []
 
-def validate_probability(prob: float) -> float:
-    """
-    التحقق من أن القيمة احتمال صالح (بين 0 و 1).
+    for team_key, team_data in teams_map.items():
+        if not isinstance(team_data, dict):
+            continue
 
-    المعاملات:
-        prob: القيمة المراد التحقق منها
+        team_id = team_data.get("id")
+        if team_id is None:
+            continue
 
-    العائد:
-        القيمة المُصححة (بين 0.0 و 1.0)
-    """
-    if math.isnan(prob) or math.isinf(prob):
-        return 0.0
-    return max(0.0, min(1.0, prob))
-
-
-# -----------------------------------------------------------------------------
-# كلاس Predictor
-# -----------------------------------------------------------------------------
-
-class Predictor:
-    """
-    المتنبئ الموحّد لنتائج المباريات باستخدام نموذج Dixon-Coles الإحصائي.
-
-    يقوم بتحميل النماذج المدرّبة مسبقاً ويوفّر واجهة بسيطة للتنبؤ
-    بنتائج المباريات عبر أسماء الفرق أو معرّفاتها.
-
-    المُكوّنات المُحمّلة:
-    - league_averages.json: متوسطات أهداف المضيف والضيف لكل موسم
-    - team_factors.json: عوامل الهجوم والدفاع لكل فريق في كل موسم
-    - elo_ratings.json: تقييمات ELO لكل فريق في كل موسم
-    - rho_values.json: معامل الارتباط Dixon-Coles لكل موسم
-    - teams.json: خريطة الفرق (أسماء ومعرّفات)
-
-    مثال الاستخدام:
-        predictor = Predictor()
-        result = predictor.predict("Manchester City", "Liverpool", "PL", topk=5, use_elo=True)
-        print(result["probabilities"])
-    """
-
-    def __init__(self, auto_load: bool = True):
-        """
-        إنشاء كائن المتنبئ.
-
-        المعاملات:
-            auto_load: إذا True، يتم تحميل النماذج تلقائياً عند الإنشاء.
-                       إذا False، يجب استدعاء reload() يدوياً.
-        """
-        self.models: Dict[str, Dict] = {}
-        self.teams_map: Dict = {}
-        self._loaded: bool = False
-        self._load_errors: List[str] = []
-
-        if auto_load:
-            self.reload()
-
-    # =========================================================================
-    # تحميل البيانات
-    # =========================================================================
-
-    def _load_json_safe(self, path: Path, description: str) -> Optional[Dict]:
-        """
-        تحميل ملف JSON بأمان بدون إيقاف التطبيق.
-
-        المعاملات:
-            path: مسار الملف
-            description: وصف الملف (للرسائل)
-
-        العائد:
-            محتوى الملف كقاموس، أو None في حالة الفشل
-        """
-        try:
-            if not path.exists():
-                error_msg = f"ملف {description} غير موجود: {path}"
-                log(error_msg, "WARNING")
-                self._load_errors.append(error_msg)
-                return None
-
-            with open(path, "r", encoding="utf-8") as f:
-                data = json.load(f)
-
-            if not isinstance(data, (dict, list)):
-                error_msg = (
-                    f"تنسيق ملف {description} غير متوقع: "
-                    f"المتوقع dict/list، الموجود {type(data).__name__}"
-                )
-                log(error_msg, "WARNING")
-                self._load_errors.append(error_msg)
-                return None
-
-            log(f"تم تحميل {description}: {path.name}", "INFO")
-            return data
-
-        except json.JSONDecodeError as e:
-            error_msg = f"خطأ في تحليل ملف {description}: {e}"
-            log(error_msg, "WARNING")
-            self._load_errors.append(error_msg)
-            return None
-
-        except Exception as e:
-            error_msg = f"خطأ أثناء تحميل {description}: {e}"
-            log(error_msg, "WARNING")
-            self._load_errors.append(error_msg)
-            return None
-
-    def _load_models(self) -> Dict[str, Dict]:
-        """
-        تحميل جميع ملفات النماذج الإحصائية.
-
-        لا يتوقف إذا كان أحد الملفات مفقوداً — يستخدم قاموساً فارغاً بدلاً منه.
-
-        العائد:
-            قاموس يحتوي على جميع النماذج المحمّلة
-        """
-        log("جارٍ تحميل النماذج الإحصائية المدرّبة...", "INFO")
-
-        models = {
-            "averages": (
-                self._load_json_safe(
-                    config.MODELS_DIR / "league_averages.json",
-                    "متوسطات الدوري"
-                )
-                or {}
-            ),
-            "factors": (
-                self._load_json_safe(
-                    config.MODELS_DIR / "team_factors.json",
-                    "عوامل الفرق"
-                )
-                or {}
-            ),
-            "elo": (
-                self._load_json_safe(
-                    config.MODELS_DIR / "elo_ratings.json",
-                    "تقييمات ELO"
-                )
-                or {}
-            ),
-            "rho": (
-                self._load_json_safe(
-                    config.MODELS_DIR / "rho_values.json",
-                    "قيم rho"
-                )
-                or {}
-            ),
-        }
-
-        # ملخص التحميل
-        for model_name, model_data in models.items():
-            season_count = len(model_data) if isinstance(model_data, dict) else 0
-            log(f"  {model_name}: {season_count} موسم", "INFO")
-
-        return models
-
-    def _load_teams_map(self) -> Dict:
-        """
-        تحميل خريطة الفرق من ملف teams.json.
-
-        العائد:
-            قاموس الفرق، أو قاموس فارغ في حالة الفشل
-        """
-        log("جارٍ تحميل خريطة الفرق...", "INFO")
-
-        teams_map = self._load_json_safe(
-            config.DATA_DIR / "teams.json",
-            "خريطة الفرق"
-        )
-
-        if teams_map is None:
-            return {}
-
-        if isinstance(teams_map, dict):
-            log(f"  عدد الفرق: {len(teams_map)}", "INFO")
-            return teams_map
-
-        # في حالة كان الملف قائمة بدلاً من قاموس
-        log(
-            "تنسيق خريطة الفرق غير متوقع (ليس قاموساً). "
-            "سيتم تحويله.",
-            "WARNING"
-        )
-        return {}
-
-    def reload(self):
-        """
-        إعادة تحميل جميع النماذج وخريطة الفرق.
-        مفيد بعد إعادة تدريب النماذج بدون إعادة تشغيل التطبيق.
-        """
-        log("=" * 50, "INFO")
-        log("إعادة تحميل النماذج وخريطة الفرق", "INFO")
-        log("=" * 50, "INFO")
-
-        self._load_errors = []
-        self.models = self._load_models()
-        self.teams_map = self._load_teams_map()
-
-        # تحديد حالة التحميل
-        required_models = ["averages", "factors", "elo", "rho"]
-        all_loaded = all(
-            bool(self.models.get(m)) for m in required_models
-        )
-
-        self._loaded = all_loaded and bool(self.teams_map)
-
-        if self._loaded:
-            log("✅ تم تحميل جميع النماذج بنجاح.", "INFO")
-        else:
-            missing = [
-                m for m in required_models if not self.models.get(m)
-            ]
-            if missing:
-                log(
-                    f"⚠ نماذج مفقودة: {missing}. "
-                    f"بعض وظائف التنبؤ قد لا تعمل.",
-                    "WARNING"
-                )
-            if not self.teams_map:
-                log(
-                    "⚠ خريطة الفرق مفقودة. البحث بالاسم لن يعمل.",
-                    "WARNING"
-                )
-
-    @property
-    def is_loaded(self) -> bool:
-        """هل تم تحميل جميع النماذج بنجاح."""
-        return self._loaded
-
-    @property
-    def load_errors(self) -> List[str]:
-        """قائمة أخطاء التحميل (إن وُجدت)."""
-        return self._load_errors.copy()
-
-    @property
-    def available_seasons(self) -> List[str]:
-        """قائمة المواسم المتاحة في النماذج المحمّلة."""
-        seasons: set = set()
-
-        for model_name in ("averages", "factors", "elo", "rho"):
-            model_data = self.models.get(model_name, {})
-            if isinstance(model_data, dict):
-                seasons.update(model_data.keys())
-
-        return sorted(seasons)
-
-    @property
-    def complete_seasons(self) -> List[str]:
-        """
-        قائمة المواسم التي تتوفر فيها جميع مكونات النموذج
-        (averages + factors + elo + rho).
-        """
-        required_models = ("averages", "factors", "elo", "rho")
-        all_keys: List[set] = []
-
-        for model_name in required_models:
-            model_data = self.models.get(model_name, {})
-            if isinstance(model_data, dict):
-                all_keys.append(set(model_data.keys()))
-            else:
-                all_keys.append(set())
-
-        if not all_keys:
-            return []
-
-        # المواسم الموجودة في جميع النماذج
-        common_keys = all_keys[0]
-        for keys in all_keys[1:]:
-            common_keys = common_keys.intersection(keys)
-
-        return sorted(common_keys)
-
-    # =========================================================================
-    # البحث عن الفرق
-    # =========================================================================
-
-    def find_team_id(
-        self,
-        team_identifier: Union[str, int],
-        comp_code: Optional[str] = None,
-    ) -> Optional[int]:
-        """
-        البحث عن معرّف فريق بالاسم أو التحقق من صلاحية المعرّف.
-
-        إذا كان المدخل عدداً صحيحاً، يتم إرجاعه مباشرة.
-        إذا كان نصاً، يتم البحث في خريطة الفرق.
-
-        المعاملات:
-            team_identifier: اسم الفريق (str) أو معرّفه (int)
-            comp_code: رمز المسابقة (اختياري — لتضييق البحث)
-
-        العائد:
-            معرّف الفريق، أو None إذا لم يُوجد
-        """
-        # إذا كان عدداً صحيحاً، نُرجعه مباشرة
-        if isinstance(team_identifier, int):
-            return team_identifier
-
-        # إذا كان نصاً يمثّل عدداً
-        if isinstance(team_identifier, str):
-            try:
-                return int(team_identifier)
-            except ValueError:
-                pass
-
-        # البحث بالاسم
-        if not self.teams_map:
-            log(
-                f"خريطة الفرق غير محمّلة. لا يمكن البحث عن: '{team_identifier}'",
-                "WARNING"
-            )
-            return None
-
-        team_id = enhanced_team_search(
-            str(team_identifier),
-            self.teams_map,
-            comp_code or ""
-        )
-
-        return team_id
-
-    def get_team_name(self, team_id: int) -> str:
-        """
-        الحصول على اسم الفريق من معرّفه.
-
-        المعاملات:
-            team_id: معرّف الفريق
-
-        العائد:
-            اسم الفريق، أو "Team {id}" إذا لم يُوجد
-        """
-        if not self.teams_map:
-            return f"Team {team_id}"
-
-        team_id_str = str(team_id)
-
-        for team_key, team_data in self.teams_map.items():
-            if not isinstance(team_data, dict):
+        # التحقق من المسابقة إذا حُددت
+        if comp_code:
+            competitions = team_data.get("competitions", [])
+            if comp_code not in competitions:
                 continue
 
-            if str(team_data.get("id")) == team_id_str:
-                names = team_data.get("names", [])
-                if isinstance(names, list):
-                    valid_names = [n for n in names if n and isinstance(n, str)]
-                    if valid_names:
-                        # تفضيل الأسماء الكاملة (تحتوي مسافة) والأطول
-                        def name_score(n: str) -> Tuple[int, int]:
-                            return (int(" " in n), len(n))
+        # البحث في جميع الأسماء
+        names = team_data.get("names", [])
+        if not isinstance(names, list):
+            names = [names] if names else []
 
-                        return max(valid_names, key=name_score)
+        for name in names:
+            if not name:
+                continue
 
-                return f"Team {team_id}"
+            name_lower = name.lower().strip()
 
-        return f"Team {team_id}"
+            # تطابق كامل
+            if name_lower == team_name_lower:
+                return int(team_id)
 
-    # =========================================================================
-    # اختيار الموسم
-    # =========================================================================
+            # تطابق جزئي
+            if team_name_lower in name_lower or name_lower in team_name_lower:
+                candidates.append((int(team_id), name, len(name)))
 
-    def _select_season_key(
-        self,
-        comp_code: str,
-        preferred_year: Optional[int] = None,
-    ) -> str:
-        """
-        اختيار مفتاح الموسم الأنسب للتنبؤ.
+    # إرجاع أفضل تطابق جزئي (الأقصر اسماً — أكثر دقة)
+    if candidates:
+        candidates.sort(key=lambda x: x[2])
+        best_id, best_name, _ = candidates[0]
 
-        يحاول الموسم الحالي أولاً، ثم يبحث في المواسم السابقة.
-        يتحقق من توفر جميع مكونات النموذج (averages, factors, elo, rho).
-
-        المعاملات:
-            comp_code: رمز المسابقة
-            preferred_year: سنة بداية الموسم المفضّل (اختياري)
-
-        العائد:
-            مفتاح الموسم المختار
-
-        الاستثناءات:
-            ValueError: إذا لم يتم العثور على نموذج كامل لأي موسم
-        """
-        required_models = ("elo", "factors", "averages", "rho")
-
-        # تحديد سنة البداية
-        if preferred_year is not None:
-            start_year = preferred_year
-        else:
-            start_year = current_season_year()
-
-        # البحث في المواسم (من الأحدث إلى الأقدم)
-        for offset in range(MAX_SEASON_LOOKBACK):
-            year = start_year - offset
-            candidate_key = f"{comp_code}_{year}"
-
-            # التحقق من توفر جميع المكونات
-            all_available = True
-            for model_name in required_models:
-                model_data = self.models.get(model_name, {})
-                if not isinstance(model_data, dict):
-                    all_available = False
-                    break
-                if candidate_key not in model_data:
-                    all_available = False
-                    break
-
-            if all_available:
-                if offset > 0:
-                    log(
-                        f"لم يتوفر نموذج للموسم الحالي ({comp_code}_{start_year}). "
-                        f"تم استخدام: {candidate_key}",
-                        "WARNING"
-                    )
-                return candidate_key
-
-        # لم يتم العثور على أي موسم كامل
-        available = self.complete_seasons
-        comp_seasons = [s for s in available if s.startswith(f"{comp_code}_")]
-
-        if comp_seasons:
-            # استخدام أحدث موسم متاح لهذه المسابقة
-            latest = comp_seasons[-1]
+        if len(candidates) > 1:
             log(
-                f"لم يتوفر نموذج حديث لـ {comp_code}. "
-                f"استخدام أحدث موسم متاح: {latest}",
+                f"وُجد أكثر من تطابق لـ '{team_name}': "
+                f"{[(c[1], c[0]) for c in candidates[:5]]}. "
+                f"تم اختيار: {best_name} (ID: {best_id})",
                 "WARNING"
             )
-            return latest
-
-        raise ValueError(
-            f"لا يوجد نموذج إحصائي كامل متاح لمسابقة '{comp_code}'. "
-            f"المواسم الكاملة المتاحة: {available or 'لا يوجد'}. "
-            f"يرجى تشغيل 02_trainer.py أولاً."
-        )
-
-    # =========================================================================
-    # حساب λ وتعديل ELO
-    # =========================================================================
-
-    def _compute_base_lambdas(
-        self,
-        home_id: int,
-        away_id: int,
-        season_key: str,
-    ) -> Tuple[float, float, Dict[str, Any]]:
-        """
-        حساب معدّلات الأهداف الأساسية (λ) باستخدام عوامل الفرق ومتوسطات الدوري.
-
-        λ_home = A_home * D_away * avg_home_goals
-        λ_away = A_away * D_home * avg_away_goals
-
-        المعاملات:
-            home_id: معرّف الفريق المضيف
-            away_id: معرّف الفريق الضيف
-            season_key: مفتاح الموسم
-
-        العائد:
-            tuple يحتوي على:
-            - lambda_home: معدّل أهداف المضيف
-            - lambda_away: معدّل أهداف الضيف
-            - details: قاموس تفاصيل الحساب (للتوثيق)
-        """
-        h_id_str = str(home_id)
-        a_id_str = str(away_id)
-
-        # --- متوسطات الدوري ---
-        avgs = self.models.get("averages", {}).get(season_key, {})
-        avg_home = safe_float(avgs.get("avg_home_goals", DEFAULT_AVG_HOME_GOALS), DEFAULT_AVG_HOME_GOALS)
-        avg_away = safe_float(avgs.get("avg_away_goals", DEFAULT_AVG_AWAY_GOALS), DEFAULT_AVG_AWAY_GOALS)
-
-        # --- عوامل الفرق ---
-        factors = self.models.get("factors", {}).get(season_key, {})
-        attack_factors = factors.get("attack", {})
-        defense_factors = factors.get("defense", {})
-
-        home_attack = safe_float(attack_factors.get(h_id_str, DEFAULT_FACTOR), DEFAULT_FACTOR)
-        home_defense = safe_float(defense_factors.get(h_id_str, DEFAULT_FACTOR), DEFAULT_FACTOR)
-        away_attack = safe_float(attack_factors.get(a_id_str, DEFAULT_FACTOR), DEFAULT_FACTOR)
-        away_defense = safe_float(defense_factors.get(a_id_str, DEFAULT_FACTOR), DEFAULT_FACTOR)
-
-        # --- حساب λ ---
-        lam_home = home_attack * away_defense * avg_home
-        lam_away = away_attack * home_defense * avg_away
-
-        # ضمان قيم موجبة
-        lam_home = max(lam_home, MIN_LAMBDA)
-        lam_away = max(lam_away, MIN_LAMBDA)
-
-        # تفاصيل الحساب
-        details = {
-            "avg_home_goals": round(avg_home, 4),
-            "avg_away_goals": round(avg_away, 4),
-            "home_attack": round(home_attack, 4),
-            "home_defense": round(home_defense, 4),
-            "away_attack": round(away_attack, 4),
-            "away_defense": round(away_defense, 4),
-            "lambda_home_base": round(lam_home, 4),
-            "lambda_away_base": round(lam_away, 4),
-            "home_in_factors": h_id_str in attack_factors,
-            "away_in_factors": a_id_str in attack_factors,
-        }
-
-        return lam_home, lam_away, details
-
-    def _get_elo_ratings(
-        self,
-        home_id: int,
-        away_id: int,
-        season_key: str,
-    ) -> Tuple[float, float]:
-        """
-        استرجاع تقييمات ELO للفريقين.
-
-        المعاملات:
-            home_id: معرّف المضيف
-            away_id: معرّف الضيف
-            season_key: مفتاح الموسم
-
-        العائد:
-            tuple يحتوي على (elo_home, elo_away)
-        """
-        elo_data = self.models.get("elo", {}).get(season_key, {})
-
-        elo_home = safe_float(
-            elo_data.get(str(home_id), DEFAULT_ELO),
-            DEFAULT_ELO
-        )
-        elo_away = safe_float(
-            elo_data.get(str(away_id), DEFAULT_ELO),
-            DEFAULT_ELO
-        )
-
-        return elo_home, elo_away
-
-    def _get_rho(self, season_key: str) -> float:
-        """
-        استرجاع معامل الارتباط (rho) لموسم معيّن.
-
-        المعاملات:
-            season_key: مفتاح الموسم
-
-        العائد:
-            قيمة rho
-        """
-        rho_data = self.models.get("rho", {})
-
-        if isinstance(rho_data, dict):
-            rho_value = rho_data.get(season_key, DEFAULT_RHO)
         else:
-            rho_value = DEFAULT_RHO
+            log(f"تم العثور على الفريق: {best_name} (ID: {best_id})", "INFO")
 
-        return safe_float(rho_value, DEFAULT_RHO)
+        return best_id
 
-    def _adjust_lambdas_with_elo(
-        self,
-        lam_home: float,
-        lam_away: float,
-        elo_home: float,
-        elo_away: float,
-    ) -> Tuple[float, float]:
-        """
-        تعديل معدّلات الأهداف (λ) باستخدام فرق تقييمات ELO.
+    log(f"لم يتم العثور على فريق يطابق: '{team_name}'", "WARNING")
+    return None
 
-        يحسب عامل التعديل بناءً على:
-        - فرق ELO بين الفريقين
-        - أفضلية الأرض (Home Field Advantage)
-        - مقياس التحويل (ELO_LAMBDA_SCALE)
 
-        المعاملات:
-            lam_home: معدّل أهداف المضيف الأصلي
-            lam_away: معدّل أهداف الضيف الأصلي
-            elo_home: تقييم ELO للمضيف
-            elo_away: تقييم ELO للضيف
+def get_team_name(
+    teams_map: Optional[Dict],
+    team_id: int
+) -> str:
+    """
+    الحصول على اسم الفريق من معرّفه.
 
-        العائد:
-            tuple يحتوي على (lambda_home_adjusted, lambda_away_adjusted)
-        """
-        # استخراج إعدادات ELO
-        elo_hfa = safe_float(
-            getattr(config, "ELO_HFA", 60.0),
-            60.0
+    المعاملات:
+        teams_map: خريطة الفرق
+        team_id: معرّف الفريق
+
+    العائد:
+        اسم الفريق، أو "Team {id}" إذا لم يُوجد
+    """
+    if teams_map is None:
+        return f"Team {team_id}"
+
+    team_id_str = str(team_id)
+
+    for team_key, team_data in teams_map.items():
+        if not isinstance(team_data, dict):
+            continue
+
+        if str(team_data.get("id")) == team_id_str:
+            names = team_data.get("names", [])
+            if isinstance(names, list) and names:
+                # اختيار الاسم الأطول (عادة الأكثر وصفاً)
+                valid_names = [n for n in names if n]
+                if valid_names:
+                    return max(valid_names, key=len)
+            return f"Team {team_id}"
+
+    return f"Team {team_id}"
+
+
+# -----------------------------------------------------------------------------
+# القسم الثالث: بناء الميزات والتنبؤ
+# -----------------------------------------------------------------------------
+
+def validate_season_data(
+    season_key: str,
+    team_factors: Dict,
+    elo_ratings: Dict,
+    h_id_str: str,
+    a_id_str: str,
+) -> Tuple[bool, Optional[str]]:
+    """
+    التحقق من توفر بيانات الموسم للفريقين.
+
+    المعاملات:
+        season_key: مفتاح الموسم
+        team_factors: جميع عوامل الفرق
+        elo_ratings: جميع تقييمات ELO
+        h_id_str: معرّف المضيف كنص
+        a_id_str: معرّف الضيف كنص
+
+    العائد:
+        tuple يحتوي على (متوفر?, سبب عدم التوفر إن وُجد)
+    """
+    # التحقق من وجود بيانات الموسم
+    season_factors = team_factors.get(season_key)
+    season_elo = elo_ratings.get(season_key)
+
+    if not season_factors:
+        available_seasons = sorted(team_factors.keys())
+        return False, (
+            f"لم يتم العثور على عوامل الفرق للموسم '{season_key}'. "
+            f"المواسم المتاحة: {available_seasons}"
         )
-        elo_lambda_scale = safe_float(
-            getattr(config, "ELO_LAMBDA_SCALE", 400.0),
-            400.0
+
+    if not season_elo:
+        available_seasons = sorted(elo_ratings.keys())
+        return False, (
+            f"لم يتم العثور على تقييمات ELO للموسم '{season_key}'. "
+            f"المواسم المتاحة: {available_seasons}"
         )
 
-        # منع القسمة على صفر
-        if elo_lambda_scale == 0:
-            elo_lambda_scale = 400.0
+    # التحقق من وجود الفريقين في بيانات الموسم (تحذير فقط)
+    attack_factors = season_factors.get("attack", {})
+    defense_factors = season_factors.get("defense", {})
 
-        # حساب الأفضلية الإجمالية
-        edge = (elo_home - elo_away) + elo_hfa
+    warnings = []
 
-        # حساب عامل التعديل
-        # تقييد edge لمنع overflow في الأُس
-        clamped_edge = max(-800.0, min(800.0, edge))
-        factor = 10.0 ** (clamped_edge / elo_lambda_scale)
+    if h_id_str not in attack_factors:
+        warnings.append(
+            f"الفريق المضيف (ID: {h_id_str}) غير موجود في عوامل الهجوم. "
+            f"سيتم استخدام القيمة الافتراضية (1.0)."
+        )
 
-        # تعديل λ
-        adjusted_home = lam_home * factor
-        adjusted_away = max(MIN_LAMBDA, lam_away / factor)
+    if a_id_str not in attack_factors:
+        warnings.append(
+            f"الفريق الضيف (ID: {a_id_str}) غير موجود في عوامل الهجوم. "
+            f"سيتم استخدام القيمة الافتراضية (1.0)."
+        )
 
-        return adjusted_home, adjusted_away
+    if h_id_str not in season_elo:
+        warnings.append(
+            f"الفريق المضيف (ID: {h_id_str}) غير موجود في تقييمات ELO. "
+            f"سيتم استخدام القيمة الافتراضية (1500.0)."
+        )
 
-    # =========================================================================
-    # التنبؤ الرئيسي
-    # =========================================================================
+    if a_id_str not in season_elo:
+        warnings.append(
+            f"الفريق الضيف (ID: {a_id_str}) غير موجود في تقييمات ELO. "
+            f"سيتم استخدام القيمة الافتراضية (1500.0)."
+        )
 
-    def predict(
-        self,
-        team1_name: str,
-        team2_name: str,
-        comp_code: str,
-        topk: int = 0,
-        use_elo: bool = False,
-        preferred_season_year: Optional[int] = None,
-    ) -> Dict[str, Any]:
-        """
-        التنبؤ بنتيجة مباراة واحدة.
+    for warning in warnings:
+        log(f"  ⚠ {warning}", "WARNING")
 
-        المعاملات:
-            team1_name: اسم الفريق المضيف (أو معرّفه كنص)
-            team2_name: اسم الفريق الضيف (أو معرّفه كنص)
-            comp_code: رمز المسابقة (مثلاً "PL", "CL", "PD")
-            topk: عدد أفضل النتائج المحتملة للإرجاع (0 = بدون)
-            use_elo: تفعيل تعديل ELO في حساب λ
-            preferred_season_year: سنة الموسم المفضّل (None = تلقائي)
+    return True, None
 
-        العائد:
-            قاموس يحتوي على:
-            - meta: بيانات وصفية (الإصدار، الموسم المُستخدم)
-            - match: وصف المباراة
-            - competition: رمز المسابقة
-            - teams_found: معلومات الفرق (أسماء ومعرّفات)
-            - model_inputs: مدخلات النموذج (λ, rho, إلخ)
-            - probabilities: الاحتمالات (home_win, draw, away_win)
-            - top_scorelines: أفضل النتائج المحتملة (إذا topk > 0)
 
-        الاستثناءات:
-            ValueError: إذا لم يتم العثور على الفرق أو النماذج
-        """
-        log("--- بدء عملية التنبؤ ---", "DEBUG")
+def build_features(
+    home_team_id: int,
+    away_team_id: int,
+    competition_code: str,
+    season_start_year: int,
+    all_matches: List[Dict],
+    team_factors: Dict,
+    elo_ratings: Dict,
+    form_matches: int = DEFAULT_FORM_MATCHES,
+) -> Tuple[Optional[pd.DataFrame], Optional[Dict[str, float]]]:
+    """
+    بناء ميزات التنبؤ لمباراة واحدة.
 
-        # --- الخطوة 1: تنظيف المدخلات ---
-        comp_code = comp_code.strip().upper()
+    المعاملات:
+        home_team_id: معرّف الفريق المضيف
+        away_team_id: معرّف الفريق الضيف
+        competition_code: رمز المسابقة
+        season_start_year: سنة بداية الموسم
+        all_matches: جميع المباريات (لحساب الفورمة)
+        team_factors: عوامل الفرق لكل موسم
+        elo_ratings: تقييمات ELO لكل موسم
+        form_matches: عدد المباريات لحساب الفورمة
 
+    العائد:
+        tuple يحتوي على:
+        - DataFrame الميزات (صف واحد)، أو None في حالة الفشل
+        - قاموس قيم الميزات (للعرض)، أو None
+    """
+    log("جارٍ بناء ميزات التنبؤ...", "INFO")
+
+    # بناء مفتاح الموسم
+    season_key = f"{competition_code}_{season_start_year}"
+    h_id_str = str(home_team_id)
+    a_id_str = str(away_team_id)
+
+    log(f"  مفتاح الموسم: {season_key}", "INFO")
+    log(f"  المضيف: ID={h_id_str}", "INFO")
+    log(f"  الضيف: ID={a_id_str}", "INFO")
+
+    # التحقق من توفر بيانات الموسم
+    is_available, error_msg = validate_season_data(
+        season_key, team_factors, elo_ratings, h_id_str, a_id_str
+    )
+
+    if not is_available:
+        log(error_msg, "ERROR")
+        return None, None
+
+    # استخراج بيانات الموسم
+    season_factors = team_factors[season_key]
+    season_elo = elo_ratings[season_key]
+
+    attack_factors = season_factors.get("attack", {})
+    defense_factors = season_factors.get("defense", {})
+
+    # --- استخراج عوامل الهجوم والدفاع ---
+    home_attack = float(attack_factors.get(h_id_str, 1.0))
+    away_attack = float(attack_factors.get(a_id_str, 1.0))
+    home_defense = float(defense_factors.get(h_id_str, 1.0))
+    away_defense = float(defense_factors.get(a_id_str, 1.0))
+
+    # --- استخراج تقييمات ELO ---
+    home_elo = float(season_elo.get(h_id_str, 1500.0))
+    away_elo = float(season_elo.get(a_id_str, 1500.0))
+    elo_diff = home_elo - away_elo
+
+    # --- حساب الفورمة ---
+    # نستخدم التاريخ الحالي كمرجع (أي نأخذ آخر N مباراة حتى الآن)
+    prediction_date = datetime.now(timezone.utc)
+
+    home_form = calculate_team_form(
+        all_matches, home_team_id, prediction_date, num_matches=form_matches
+    )
+    away_form = calculate_team_form(
+        all_matches, away_team_id, prediction_date, num_matches=form_matches
+    )
+
+    home_avg_points = float(home_form.get("avg_points", 1.0))
+    away_avg_points = float(away_form.get("avg_points", 1.0))
+
+    home_form_count = int(home_form.get("matches_found", 0))
+    away_form_count = int(away_form.get("matches_found", 0))
+
+    # --- بناء قاموس الميزات ---
+    features_values = {
+        "home_attack": home_attack,
+        "away_attack": away_attack,
+        "home_defense": home_defense,
+        "away_defense": away_defense,
+        "home_elo": home_elo,
+        "away_elo": away_elo,
+        "elo_diff": elo_diff,
+        "home_avg_points": home_avg_points,
+        "away_avg_points": away_avg_points,
+    }
+
+    # عرض الميزات
+    log("", "INFO")
+    log("  الميزات المُستخرجة:", "INFO")
+    for feat_name, feat_value in features_values.items():
+        log(f"    {feat_name:20s}: {feat_value:.4f}", "INFO")
+
+    log(
+        f"    {'home_form_count':20s}: {home_form_count} مباراة "
+        f"(من أصل {form_matches} مطلوبة)",
+        "INFO"
+    )
+    log(
+        f"    {'away_form_count':20s}: {away_form_count} مباراة "
+        f"(من أصل {form_matches} مطلوبة)",
+        "INFO"
+    )
+
+    if home_form_count == 0:
+        log("  ⚠ لم تُوجد مباريات سابقة للمضيف لحساب الفورمة.", "WARNING")
+    if away_form_count == 0:
+        log("  ⚠ لم تُوجد مباريات سابقة للضيف لحساب الفورمة.", "WARNING")
+
+    # --- تحويل إلى DataFrame ---
+    features_dict_for_df = {k: [v] for k, v in features_values.items()}
+    features_df = pd.DataFrame(features_dict_for_df)
+
+    # التحقق من ترتيب الأعمدة (يجب أن يطابق ترتيب التدريب)
+    expected_cols = EXPECTED_FEATURES
+    actual_cols = list(features_df.columns)
+
+    if actual_cols != expected_cols:
         log(
-            f"الخطوة 1: طلب تنبؤ — "
-            f"{team1_name} vs {team2_name} في {comp_code}",
-            "DEBUG"
+            f"  ⚠ ترتيب الأعمدة لا يطابق المتوقع. إعادة ترتيب...",
+            "WARNING"
         )
+        # إعادة ترتيب الأعمدة
+        missing_cols = [c for c in expected_cols if c not in actual_cols]
+        if missing_cols:
+            log(f"  ❌ أعمدة مفقودة: {missing_cols}", "ERROR")
+            return None, None
 
-        # --- الخطوة 2: البحث عن الفرق ---
-        home_id = self.find_team_id(team1_name, comp_code)
-        away_id = self.find_team_id(team2_name, comp_code)
+        features_df = features_df[expected_cols]
 
-        log(
-            f"الخطوة 2: نتيجة البحث — "
-            f"المضيف ID: {home_id}, الضيف ID: {away_id}",
-            "DEBUG"
-        )
+    return features_df, features_values
 
-        if not home_id:
-            raise ValueError(
-                f"لم يتم العثور على الفريق المضيف: '{team1_name}' "
-                f"في مسابقة '{comp_code}'."
-            )
 
-        if not away_id:
-            raise ValueError(
-                f"لم يتم العثور على الفريق الضيف: '{team2_name}' "
-                f"في مسابقة '{comp_code}'."
-            )
+def extract_probabilities(
+    model: Any,
+    features_df: pd.DataFrame,
+) -> Optional[Dict[str, float]]:
+    """
+    استخراج احتمالات التنبؤ من نموذج XGBoost.
 
-        if home_id == away_id:
-            raise ValueError(
-                f"لا يمكن التنبؤ بمباراة بين نفس الفريق "
-                f"(ID: {home_id})."
-            )
+    يستخدم model.classes_ بدلاً من LabelEncoder لضمان
+    التوافق التام مع ترتيب الفئات الذي تدرّب عليه النموذج.
 
-        # --- الخطوة 3: اختيار الموسم ---
-        season_key = self._select_season_key(comp_code, preferred_season_year)
+    المعاملات:
+        model: نموذج XGBoost المدرّب
+        features_df: DataFrame الميزات (صف واحد)
 
-        log(f"الخطوة 3: الموسم المُختار — {season_key}", "DEBUG")
+    العائد:
+        قاموس يحتوي على:
+        - home_win: احتمال فوز المضيف
+        - draw: احتمال التعادل
+        - away_win: احتمال فوز الضيف
+        - model_classes: فئات النموذج
+        أو None في حالة الفشل
+    """
+    log("جارٍ إجراء التنبؤ...", "INFO")
 
-        # --- الخطوة 4: استرجاع بيانات النماذج ---
-        elo_home, elo_away = self._get_elo_ratings(home_id, away_id, season_key)
-        rho = self._get_rho(season_key)
+    try:
+        # التنبؤ بالاحتمالات
+        predicted_probabilities = model.predict_proba(features_df)
 
-        log(
-            f"الخطوة 4: بيانات النماذج — "
-            f"ELO({home_id})={elo_home:.0f}, ELO({away_id})={elo_away:.0f}, "
-            f"rho={rho:.4f}",
-            "DEBUG"
-        )
+        # التحقق من صحة النتائج
+        if predicted_probabilities is None or len(predicted_probabilities) == 0:
+            log("فشل النموذج في إنتاج احتمالات.", "ERROR")
+            return None
 
-        # --- الخطوة 5: حساب λ الأساسي ---
-        lam_home, lam_away, compute_details = self._compute_base_lambdas(
-            home_id, away_id, season_key
-        )
+        proba = predicted_probabilities[0]
 
-        log(
-            f"الخطوة 5: λ الأساسي — "
-            f"المضيف: {lam_home:.3f}, الضيف: {lam_away:.3f}",
-            "DEBUG"
-        )
+        # استخراج فئات النموذج
+        model_classes = list(model.classes_)
+        log(f"  فئات النموذج (model.classes_): {model_classes}", "DEBUG")
+        log(f"  الاحتمالات الخام: {[round(float(p), 4) for p in proba]}", "DEBUG")
 
-        # --- الخطوة 6: تعديل ELO (اختياري) ---
-        elo_adjusted = False
-        if use_elo:
-            lam_home_original = lam_home
-            lam_away_original = lam_away
+        # التحقق من وجود جميع الفئات المتوقعة
+        for expected_class in EXPECTED_CLASSES:
+            if expected_class not in model_classes:
+                log(
+                    f"  ⚠ الفئة {expected_class} غير موجودة في model.classes_. "
+                    f"فئات النموذج: {model_classes}",
+                    "WARNING"
+                )
 
-            lam_home, lam_away = self._adjust_lambdas_with_elo(
-                lam_home, lam_away, elo_home, elo_away
-            )
+        # استخراج الاحتمالات بناءً على model.classes_
+        prob_dict = {}
 
-            elo_adjusted = True
+        for class_value, class_label_key in [
+            (-1, "away_win"),
+            (0, "draw"),
+            (1, "home_win"),
+        ]:
+            if class_value in model_classes:
+                idx = model_classes.index(class_value)
+                prob_dict[class_label_key] = float(proba[idx])
+            else:
+                # الفئة غير موجودة — نعطيها احتمال 0
+                log(
+                    f"  ⚠ الفئة {class_value} ({class_label_key}) "
+                    f"غير موجودة في النموذج. سيتم تعيين الاحتمال = 0.",
+                    "WARNING"
+                )
+                prob_dict[class_label_key] = 0.0
 
+        prob_dict["model_classes"] = model_classes
+
+        # التحقق من أن المجموع قريب من 1.0
+        total = prob_dict["home_win"] + prob_dict["draw"] + prob_dict["away_win"]
+        if abs(total - 1.0) > 0.01:
             log(
-                f"الخطوة 6: λ بعد تعديل ELO — "
-                f"المضيف: {lam_home:.3f} (كان {lam_home_original:.3f}), "
-                f"الضيف: {lam_away:.3f} (كان {lam_away_original:.3f})",
-                "DEBUG"
+                f"  ⚠ مجموع الاحتمالات ({total:.4f}) بعيد عن 1.0",
+                "WARNING"
             )
-        else:
-            log("الخطوة 6: تعديل ELO معطّل.", "DEBUG")
 
-        # --- الخطوة 7: حساب مصفوفة الاحتمالات ---
-        gmax = suggest_goal_cutoff(lam_home, lam_away)
-        matrix = poisson_matrix_dc(lam_home, lam_away, rho, max_goals=gmax)
-        p_home, p_draw, p_away = matrix_to_outcomes(matrix)
+        return prob_dict
 
-        # تطبيع وتحقق
-        p_home = validate_probability(float(p_home))
-        p_draw = validate_probability(float(p_draw))
-        p_away = validate_probability(float(p_away))
+    except Exception as e:
+        log(f"فشل التنبؤ: {e}", "ERROR")
+        traceback.print_exc()
+        return None
 
-        # تطبيع المجموع إلى 1.0
-        total = p_home + p_draw + p_away
-        if total > 0:
-            p_home /= total
-            p_draw /= total
-            p_away /= total
-        else:
-            p_home = 1.0 / 3.0
-            p_draw = 1.0 / 3.0
-            p_away = 1.0 / 3.0
 
+# -----------------------------------------------------------------------------
+# القسم الرابع: عرض النتائج
+# -----------------------------------------------------------------------------
+
+def determine_prediction(prob_dict: Dict[str, float]) -> Tuple[str, float]:
+    """
+    تحديد التنبؤ الأرجح ومستوى الثقة.
+
+    المعاملات:
+        prob_dict: قاموس الاحتمالات
+
+    العائد:
+        tuple يحتوي على (وصف التنبؤ, مستوى الثقة)
+    """
+    home_win = prob_dict.get("home_win", 0.0)
+    draw = prob_dict.get("draw", 0.0)
+    away_win = prob_dict.get("away_win", 0.0)
+
+    max_prob = max(home_win, draw, away_win)
+
+    if max_prob == home_win:
+        return "فوز المضيف", home_win
+    elif max_prob == draw:
+        return "تعادل", draw
+    else:
+        return "فوز الضيف", away_win
+
+
+def display_results(
+    home_name: str,
+    away_name: str,
+    home_team_id: int,
+    away_team_id: int,
+    competition_code: str,
+    season_key: str,
+    prob_dict: Dict[str, float],
+    features_values: Dict[str, float],
+):
+    """
+    عرض نتائج التنبؤ بشكل منسّق.
+
+    المعاملات:
+        home_name: اسم الفريق المضيف
+        away_name: اسم الفريق الضيف
+        home_team_id: معرّف المضيف
+        away_team_id: معرّف الضيف
+        competition_code: رمز المسابقة
+        season_key: مفتاح الموسم
+        prob_dict: قاموس الاحتمالات
+        features_values: قاموس قيم الميزات
+    """
+    home_win = prob_dict.get("home_win", 0.0)
+    draw = prob_dict.get("draw", 0.0)
+    away_win = prob_dict.get("away_win", 0.0)
+
+    prediction_text, confidence = determine_prediction(prob_dict)
+
+    # شريط مرئي بسيط
+    def bar(prob: float, width: int = 30) -> str:
+        filled = int(prob * width)
+        return "█" * filled + "░" * (width - filled)
+
+    print("")
+    print("=" * 60)
+    print(f"  📊 نتائج التنبؤ (XGBoost)")
+    print("=" * 60)
+    print(f"  المباراة : {home_name} vs {away_name}")
+    print(f"  المعرّفات: {home_team_id} vs {away_team_id}")
+    print(f"  المسابقة: {competition_code} | الموسم: {season_key}")
+    print("-" * 60)
+    print(f"  فوز المضيف : {home_win:6.2%}  {bar(home_win)}")
+    print(f"  تعادل       : {draw:6.2%}  {bar(draw)}")
+    print(f"  فوز الضيف  : {away_win:6.2%}  {bar(away_win)}")
+    print("-" * 60)
+    print(f"  🏆 التنبؤ: {prediction_text} (ثقة: {confidence:.1%})")
+    print("=" * 60)
+
+    # عرض الميزات
+    print("")
+    print("  الميزات المُستخدمة:")
+    print("  " + "-" * 40)
+    for feat_name, feat_value in features_values.items():
+        print(f"    {feat_name:20s}: {feat_value:.4f}")
+    print("  " + "-" * 40)
+    print("")
+
+
+# -----------------------------------------------------------------------------
+# القسم الخامس: حفظ النتائج
+# -----------------------------------------------------------------------------
+
+def build_result_dict(
+    home_name: str,
+    away_name: str,
+    home_team_id: int,
+    away_team_id: int,
+    competition_code: str,
+    season_start_year: int,
+    prob_dict: Dict[str, float],
+    features_values: Dict[str, float],
+    form_matches: int,
+) -> Dict[str, Any]:
+    """
+    بناء قاموس النتيجة الكاملة للحفظ أو العرض.
+
+    المعاملات:
+        home_name: اسم المضيف
+        away_name: اسم الضيف
+        home_team_id: معرّف المضيف
+        away_team_id: معرّف الضيف
+        competition_code: رمز المسابقة
+        season_start_year: سنة بداية الموسم
+        prob_dict: قاموس الاحتمالات
+        features_values: قاموس قيم الميزات
+        form_matches: عدد مباريات الفورمة
+
+    العائد:
+        قاموس النتيجة الكاملة
+    """
+    prediction_text, confidence = determine_prediction(prob_dict)
+
+    result = {
+        "meta": {
+            "version": getattr(config, "VERSION", "N/A"),
+            "model": "XGBClassifier",
+            "prediction_timestamp": datetime.now(timezone.utc).isoformat(),
+            "season_key": f"{competition_code}_{season_start_year}",
+            "model_classes": prob_dict.get("model_classes", []),
+            "form_matches": form_matches,
+        },
+        "match": f"{home_name} (Home) vs {away_name} (Away)",
+        "competition": competition_code,
+        "teams": {
+            "home": {"name": home_name, "id": home_team_id},
+            "away": {"name": away_name, "id": away_team_id},
+        },
+        "probabilities": {
+            "home_win": round(prob_dict.get("home_win", 0.0), 6),
+            "draw": round(prob_dict.get("draw", 0.0), 6),
+            "away_win": round(prob_dict.get("away_win", 0.0), 6),
+        },
+        "prediction": {
+            "result": prediction_text,
+            "confidence": round(confidence, 6),
+        },
+        "features_used": {
+            k: round(v, 6) for k, v in features_values.items()
+        },
+    }
+
+    return result
+
+
+def save_prediction_result(
+    result: Dict[str, Any],
+    output_path: Path,
+) -> bool:
+    """
+    حفظ نتيجة التنبؤ في ملف JSON.
+
+    المعاملات:
+        result: قاموس النتيجة
+        output_path: مسار ملف الحفظ
+
+    العائد:
+        True إذا تم الحفظ بنجاح
+    """
+    try:
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+
+        with open(output_path, "w", encoding="utf-8") as f:
+            json.dump(result, f, ensure_ascii=False, indent=2, default=str)
+
+        log(f"تم حفظ نتيجة التنبؤ في: {output_path}", "INFO")
+        return True
+
+    except Exception as e:
+        log(f"فشل حفظ نتيجة التنبؤ: {e}", "ERROR")
+        return False
+
+
+# -----------------------------------------------------------------------------
+# القسم السادس: الدالة الرئيسية
+# -----------------------------------------------------------------------------
+
+def predict_match(
+    home_team_id: Optional[int] = None,
+    away_team_id: Optional[int] = None,
+    home_team_name: Optional[str] = None,
+    away_team_name: Optional[str] = None,
+    competition_code: str = DEFAULT_COMP_CODE,
+    season_start_year: Optional[int] = None,
+    form_matches: int = DEFAULT_FORM_MATCHES,
+    save: bool = False,
+    output_path: Optional[Path] = None,
+    dry_run: bool = False,
+):
+    """
+    الدالة الرئيسية للتنبؤ بنتيجة مباراة واحدة.
+
+    يمكن تحديد الفرق بالمعرّف (--home, --away) أو بالاسم
+    (--home-name, --away-name). إذا استُخدم الاسم، يتم البحث
+    في teams.json عن المعرّف المقابل.
+
+    المعاملات:
+        home_team_id: معرّف الفريق المضيف (اختياري إذا حُدد الاسم)
+        away_team_id: معرّف الفريق الضيف (اختياري إذا حُدد الاسم)
+        home_team_name: اسم الفريق المضيف (اختياري)
+        away_team_name: اسم الفريق الضيف (اختياري)
+        competition_code: رمز المسابقة
+        season_start_year: سنة بداية الموسم (None = تلقائي)
+        form_matches: عدد مباريات الفورمة
+        save: حفظ النتيجة في ملف JSON
+        output_path: مسار ملف الحفظ (اختياري)
+        dry_run: تشغيل بدون تنبؤ فعلي
+    """
+    start_time = datetime.now(timezone.utc)
+
+    log("=" * 60, "INFO")
+    log("بدء التنبؤ بنتيجة المباراة (XGBoost)", "INFO")
+    log(f"الوقت: {start_time.isoformat()}", "INFO")
+    log("=" * 60, "INFO")
+
+    # =========================================================================
+    # 1. التحقق من المتطلبات
+    # =========================================================================
+    if not check_dependencies():
+        return
+
+    # =========================================================================
+    # 2. تحميل البيانات والنماذج
+    # =========================================================================
+    log("--- تحميل البيانات والنماذج ---", "INFO")
+
+    data = load_all_prediction_data()
+    if data is None:
+        return
+
+    model = data["model"]
+    all_matches = data["all_matches"]
+    team_factors = data["team_factors"]
+    elo_ratings = data["elo_ratings"]
+    teams_map = data.get("teams_map")
+    model_metadata = data.get("model_metadata")
+
+    # التحقق من توافق الميزات (إذا كانت البيانات الوصفية متوفرة)
+    if model_metadata:
+        expected_features = model_metadata.get("features", EXPECTED_FEATURES)
+        if expected_features != EXPECTED_FEATURES:
+            log(
+                f"⚠ الميزات في البيانات الوصفية ({expected_features}) "
+                f"تختلف عن المتوقعة ({EXPECTED_FEATURES}). "
+                f"تأكد من التوافق.",
+                "WARNING"
+            )
+
+    # =========================================================================
+    # 3. تحديد الفرق
+    # =========================================================================
+    log("--- تحديد الفرق ---", "INFO")
+
+    # إذا حُدد الاسم بدلاً من المعرّف، نبحث عن المعرّف
+    if home_team_id is None and home_team_name:
+        home_team_id = find_team_id_by_name(
+            teams_map, home_team_name, comp_code=competition_code
+        )
+        if home_team_id is None:
+            log(
+                f"لم يتم العثور على الفريق المضيف: '{home_team_name}'",
+                "ERROR"
+            )
+            return
+
+    if away_team_id is None and away_team_name:
+        away_team_id = find_team_id_by_name(
+            teams_map, away_team_name, comp_code=competition_code
+        )
+        if away_team_id is None:
+            log(
+                f"لم يتم العثور على الفريق الضيف: '{away_team_name}'",
+                "ERROR"
+            )
+            return
+
+    # التحقق من وجود معرّفات
+    if home_team_id is None:
+        log("لم يتم تحديد الفريق المضيف. استخدم --home أو --home-name.", "ERROR")
+        return
+
+    if away_team_id is None:
+        log("لم يتم تحديد الفريق الضيف. استخدم --away أو --away-name.", "ERROR")
+        return
+
+    # التحقق من اختلاف الفريقين
+    if home_team_id == away_team_id:
+        log("لا يمكن التنبؤ بمباراة بين نفس الفريق.", "ERROR")
+        return
+
+    # الحصول على أسماء الفرق
+    home_name = get_team_name(teams_map, home_team_id)
+    away_name = get_team_name(teams_map, away_team_id)
+
+    log(f"  المضيف: {home_name} (ID: {home_team_id})", "INFO")
+    log(f"  الضيف: {away_name} (ID: {away_team_id})", "INFO")
+
+    # =========================================================================
+    # 4. تحديد الموسم
+    # =========================================================================
+    if season_start_year is None:
+        season_start_year = get_current_season_year()
+        log(f"  الموسم (تلقائي): {season_start_year}", "INFO")
+    else:
+        log(f"  الموسم (محدد): {season_start_year}", "INFO")
+
+    season_key = f"{competition_code}_{season_start_year}"
+    log(f"  مفتاح الموسم: {season_key}", "INFO")
+    log(f"  المسابقة: {competition_code}", "INFO")
+
+    # =========================================================================
+    # 5. التشغيل الجاف
+    # =========================================================================
+    if dry_run:
+        log("", "INFO")
+        log("[DRY RUN] سيتم التنبؤ بالمباراة التالية:", "INFO")
+        log(f"  {home_name} (ID: {home_team_id}) vs {away_name} (ID: {away_team_id})", "INFO")
+        log(f"  المسابقة: {competition_code} | الموسم: {season_key}", "INFO")
+        log(f"  مباريات الفورمة: {form_matches}", "INFO")
+        log("[DRY RUN] لم يتم تنفيذ التنبؤ.", "INFO")
+        return
+
+    # =========================================================================
+    # 6. بناء الميزات
+    # =========================================================================
+    log("--- بناء الميزات ---", "INFO")
+
+    features_df, features_values = build_features(
+        home_team_id=home_team_id,
+        away_team_id=away_team_id,
+        competition_code=competition_code,
+        season_start_year=season_start_year,
+        all_matches=all_matches,
+        team_factors=team_factors,
+        elo_ratings=elo_ratings,
+        form_matches=form_matches,
+    )
+
+    if features_df is None or features_values is None:
+        log("فشل بناء الميزات. لا يمكن إجراء التنبؤ.", "ERROR")
+        return
+
+    # =========================================================================
+    # 7. إجراء التنبؤ
+    # =========================================================================
+    log("--- إجراء التنبؤ ---", "INFO")
+
+    prob_dict = extract_probabilities(model, features_df)
+
+    if prob_dict is None:
+        log("فشل استخراج الاحتمالات. لا يمكن عرض النتائج.", "ERROR")
+        return
+
+    # =========================================================================
+    # 8. عرض النتائج
+    # =========================================================================
+    display_results(
+        home_name=home_name,
+        away_name=away_name,
+        home_team_id=home_team_id,
+        away_team_id=away_team_id,
+        competition_code=competition_code,
+        season_key=season_key,
+        prob_dict=prob_dict,
+        features_values=features_values,
+    )
+
+    # =========================================================================
+    # 9. حفظ النتائج (اختياري)
+    # =========================================================================
+    if save:
+        log("--- حفظ النتائج ---", "INFO")
+
+        result = build_result_dict(
+            home_name=home_name,
+            away_name=away_name,
+            home_team_id=home_team_id,
+            away_team_id=away_team_id,
+            competition_code=competition_code,
+            season_start_year=season_start_year,
+            prob_dict=prob_dict,
+            features_values=features_values,
+            form_matches=form_matches,
+        )
+
+        if output_path is None:
+            output_path = (
+                config.DATA_DIR
+                / f"prediction_{home_team_id}_vs_{away_team_id}_{competition_code}.json"
+            )
+
+        save_prediction_result(result, output_path)
+
+        # طباعة JSON الكاملة
+        print("")
+        print("النتيجة الكاملة (JSON):")
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+        print("")
+
+    # =========================================================================
+    # ملخص
+    # =========================================================================
+    end_time = datetime.now(timezone.utc)
+    duration = (end_time - start_time).total_seconds()
+
+    log(f"اكتمل التنبؤ في {duration:.1f} ثانية.", "INFO")
+    log("=" * 60, "INFO")
+
+
+# -----------------------------------------------------------------------------
+# نقطة الدخول
+# -----------------------------------------------------------------------------
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(
+        description="التنبؤ بنتيجة مباراة كرة قدم باستخدام نموذج XGBoost.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+أمثلة الاستخدام:
+  # تنبؤ باستخدام المعرّفات الافتراضية
+  python 06_predict_ml.py
+
+  # تحديد الفرق بالمعرّف
+  python 06_predict_ml.py --home 65 --away 64 --comp PL --season 2025
+
+  # تحديد الفرق بالاسم
+  python 06_predict_ml.py --home-name "Manchester City" --away-name "Liverpool" --comp PL
+
+  # حفظ النتيجة
+  python 06_predict_ml.py --home 65 --away 64 --comp PL --save
+
+  # حفظ في ملف محدد
+  python 06_predict_ml.py --home 65 --away 64 --comp PL --save --output prediction.json
+
+  # تشغيل تجريبي
+  python 06_predict_ml.py --home 65 --away 64 --comp PL --dry-run
+
+  # تغيير عدد مباريات الفورمة
+  python 06_predict_ml.py --home 65 --away 64 --comp PL --form-matches 10
+        """
+    )
+
+    # --- تحديد الفرق ---
+    team_group = parser.add_argument_group("تحديد الفرق")
+
+    team_group.add_argument(
+        "--home",
+        type=int,
+        default=None,
+        help=f"معرّف الفريق المضيف. (افتراضي: {DEFAULT_HOME_TEAM_ID})"
+    )
+
+    team_group.add_argument(
+        "--away",
+        type=int,
+        default=None,
+        help=f"معرّف الفريق الضيف. (افتراضي: {DEFAULT_AWAY_TEAM_ID})"
+    )
+
+    team_group.add_argument(
+        "--home-name",
+        type=str,
+        default=None,
+        help="اسم الفريق المضيف (بدلاً من المعرّف). يبحث في teams.json."
+    )
+
+    team_group.add_argument(
+        "--away-name",
+        type=str,
+        default=None,
+        help="اسم الفريق الضيف (بدلاً من المعرّف). يبحث في teams.json."
+    )
+
+    # --- إعدادات المسابقة ---
+    comp_group = parser.add_argument_group("إعدادات المسابقة")
+
+    comp_group.add_argument(
+        "--comp",
+        type=str,
+        default=DEFAULT_COMP_CODE,
+        help=f"رمز المسابقة (مثل: PL, PD, SA, BL1, FL1). (افتراضي: {DEFAULT_COMP_CODE})"
+    )
+
+    comp_group.add_argument(
+        "--season",
+        type=int,
+        default=None,
+        help="سنة بداية الموسم. (افتراضي: تلقائي بناءً على التاريخ الحالي)"
+    )
+
+    # --- إعدادات التنبؤ ---
+    pred_group = parser.add_argument_group("إعدادات التنبؤ")
+
+    pred_group.add_argument(
+        "--form-matches",
+        type=int,
+        default=DEFAULT_FORM_MATCHES,
+        help=f"عدد المباريات الأخيرة لحساب الفورمة. (افتراضي: {DEFAULT_FORM_MATCHES})"
+    )
+
+    # --- إعدادات الإخراج ---
+    output_group = parser.add_argument_group("إعدادات الإخراج")
+
+    output_group.add_argument(
+        "--save",
+        action="store_true",
+        help="حفظ نتيجة التنبؤ في ملف JSON."
+    )
+
+    output_group.add_argument(
+        "--output",
+        type=str,
+        default=None,
+        help="مسار ملف الحفظ (يُستخدم مع --save). (افتراضي: تلقائي)"
+    )
+
+    output_group.add_argument(
+        "--dry-run",
+        action="store_true",
+        default=False,
+        help="تشغيل تجريبي: عرض الإعدادات بدون تنفيذ التنبؤ."
+    )
+
+    args = parser.parse_args()
+
+    # --- تحديد معرّفات الفرق ---
+    # إذا لم يُحدد المعرّف ولا الاسم، نستخدم القيم الافتراضية
+    home_id = args.home
+    away_id = args.away
+    home_name_arg = args.home_name
+    away_name_arg = args.away_name
+
+    # إذا لم يُحدد أي شيء، نستخدم الافتراضي
+    if home_id is None and home_name_arg is None:
+        home_id = DEFAULT_HOME_TEAM_ID
         log(
-            f"الخطوة 7: الاحتمالات — "
-            f"فوز المضيف: {p_home:.3f}, تعادل: {p_draw:.3f}, "
-            f"فوز الضيف: {p_away:.3f}",
-            "DEBUG"
+            f"لم يُحدد الفريق المضيف. استخدام الافتراضي: ID={DEFAULT_HOME_TEAM_ID}",
+            "INFO"
         )
 
-        # --- الخطوة 8: بناء النتيجة ---
-        result: Dict[str, Any] = {
-            "meta": {
-                "version": getattr(config, "VERSION", "N/A"),
-                "model_season_used": season_key,
-                "prediction_timestamp": datetime.now(timezone.utc).isoformat(),
-                "use_elo_adjust": use_elo,
-            },
-            "match": f"{team1_name} (Home) vs {team2_name} (Away)",
-            "competition": comp_code,
-            "teams_found": {
-                "home": {
-                    "name": team1_name,
-                    "id": home_id,
-                    "display_name": self.get_team_name(home_id),
-                },
-                "away": {
-                    "name": team2_name,
-                    "id": away_id,
-                    "display_name": self.get_team_name(away_id),
-                },
-            },
-            "model_inputs": {
-                "lambda_home": round(lam_home, 4),
-                "lambda_away": round(lam_away, 4),
-                "rho": round(rho, 4),
-                "gmax": int(gmax),
-                "use_elo_adjust": use_elo,
-                "elo_home": round(elo_home, 1),
-                "elo_away": round(elo_away, 1),
-                "elo_diff": round(elo_home - elo_away, 1),
-                **{
-                    k: v for k, v in compute_details.items()
-                    if isinstance(v, (int, float, bool))
-                },
-            },
-            "probabilities": {
-                "home_win": round(float(p_home), 6),
-                "draw": round(float(p_draw), 6),
-                "away_win": round(float(p_away), 6),
-            },
-        }
-
-        # --- الخطوة 9: أفضل النتائج المحتملة (اختياري) ---
-        if topk and topk > 0:
-            try:
-                tops = top_scorelines(matrix, top_k=topk)
-                result["top_scorelines"] = [
-                    {
-                        "home_goals": int(i),
-                        "away_goals": int(j),
-                        "prob": round(float(p), 6),
-                    }
-                    for i, j, p in tops
-                ]
-            except Exception as e:
-                log(f"فشل حساب أفضل النتائج: {e}", "WARNING")
-                result["top_scorelines"] = []
-
-        log("الخطوة 9: النتيجة جاهزة.", "DEBUG")
-
-        return result
-
-    # =========================================================================
-    # التنبؤ بالمعرّف مباشرة
-    # =========================================================================
-
-    def predict_by_id(
-        self,
-        home_team_id: int,
-        away_team_id: int,
-        comp_code: str,
-        topk: int = 0,
-        use_elo: bool = False,
-        preferred_season_year: Optional[int] = None,
-    ) -> Dict[str, Any]:
-        """
-        التنبؤ بنتيجة مباراة باستخدام معرّفات الفرق مباشرة.
-
-        هذه الدالة تتجاوز عملية البحث بالاسم وتستخدم المعرّفات مباشرة.
-        مفيدة عندما تكون المعرّفات معروفة مسبقاً.
-
-        المعاملات:
-            home_team_id: معرّف الفريق المضيف
-            away_team_id: معرّف الفريق الضيف
-            comp_code: رمز المسابقة
-            topk: عدد أفضل النتائج المحتملة
-            use_elo: تفعيل تعديل ELO
-            preferred_season_year: سنة الموسم المفضّل
-
-        العائد:
-            قاموس النتيجة (نفس بنية predict())
-        """
-        # الحصول على أسماء الفرق للعرض
-        home_name = self.get_team_name(home_team_id)
-        away_name = self.get_team_name(away_team_id)
-
-        # استخدام predict() مع المعرّفات كنص
-        # (ستتخطى البحث بالاسم لأنها أعداد)
-        return self.predict(
-            team1_name=str(home_team_id),
-            team2_name=str(away_team_id),
-            comp_code=comp_code,
-            topk=topk,
-            use_elo=use_elo,
-            preferred_season_year=preferred_season_year,
+    if away_id is None and away_name_arg is None:
+        away_id = DEFAULT_AWAY_TEAM_ID
+        log(
+            f"لم يُحدد الفريق الضيف. استخدام الافتراضي: ID={DEFAULT_AWAY_TEAM_ID}",
+            "INFO"
         )
 
-    # =========================================================================
-    # معلومات تشخيصية
-    # =========================================================================
+    # تحديد مسار الإخراج
+    output_path = Path(args.output) if args.output else None
 
-    def get_diagnostics(self) -> Dict[str, Any]:
-        """
-        الحصول على معلومات تشخيصية عن حالة المتنبئ.
-
-        العائد:
-            قاموس يحتوي على:
-            - is_loaded: هل تم التحميل بنجاح
-            - load_errors: أخطاء التحميل
-            - models_status: حالة كل نموذج
-            - teams_count: عدد الفرق
-            - available_seasons: المواسم المتاحة
-            - complete_seasons: المواسم الكاملة
-        """
-        models_status = {}
-        for model_name in ("averages", "factors", "elo", "rho"):
-            model_data = self.models.get(model_name, {})
-            models_status[model_name] = {
-                "loaded": bool(model_data),
-                "season_count": (
-                    len(model_data) if isinstance(model_data, dict) else 0
-                ),
-            }
-
-        return {
-            "is_loaded": self._loaded,
-            "load_errors": self._load_errors.copy(),
-            "models_status": models_status,
-            "teams_count": len(self.teams_map),
-            "available_seasons": self.available_seasons,
-            "complete_seasons": self.complete_seasons,
-            "config": {
-                "version": getattr(config, "VERSION", "N/A"),
-                "data_dir": str(config.DATA_DIR),
-                "models_dir": str(config.MODELS_DIR),
-                "elo_hfa": getattr(config, "ELO_HFA", "N/A"),
-                "elo_lambda_scale": getattr(config, "ELO_LAMBDA_SCALE", "N/A"),
-                "season_start_month": getattr(config, "CURRENT_SEASON_START_MONTH", "N/A"),
-            },
-        }
-
-    def __repr__(self) -> str:
-        """تمثيل نصي للمتنبئ."""
-        status = "loaded" if self._loaded else "not loaded"
-        seasons = len(self.complete_seasons)
-        teams = len(self.teams_map)
-        return (
-            f"Predictor("
-            f"status={status}, "
-            f"complete_seasons={seasons}, "
-            f"teams={teams}"
-            f")"
+    # --- تشغيل التنبؤ ---
+    try:
+        predict_match(
+            home_team_id=home_id,
+            away_team_id=away_id,
+            home_team_name=home_name_arg,
+            away_team_name=away_name_arg,
+            competition_code=args.comp,
+            season_start_year=args.season,
+            form_matches=args.form_matches,
+            save=args.save,
+            output_path=output_path,
+            dry_run=args.dry_run,
         )
+    except KeyboardInterrupt:
+        print("")
+        log("تم إيقاف العملية بواسطة المستخدم (Ctrl+C).", "WARNING")
+        sys.exit(1)
+    except Exception as e:
+        log(f"خطأ غير متوقع: {e}", "CRITICAL")
+        traceback.print_exc()
+        sys.exit(1)
